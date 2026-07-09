@@ -1,0 +1,31 @@
+schedulerName: scheduler-plugins-scheduler
+group: onlineboutique-a
+minReplicas: 2
+hpa:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+cpa:
+  enabled: false
+  image: 192.168.1.61/library/custom-pod-autoscaler:latest
+  imagePullPolicy: IfNotPresent
+  intervalMillis: 15000
+  minReplicas: 2
+  maxReplicas: 10
+  prometheusURL: http://prometheus-kube-prometheus-prometheus.observability:9090/api/v1/query
+  targetResponseTimeMillis: 250
+  targetPercentage: 0.95
+  timeRange: 1m
+  redisImage: redis:7.4-alpine
+  redisHost: custom-pod-autoscaler-redis
+  kp: 1
+  ki: 0
+  kd: 0
+  downscaleStabilization: 300
+proxyNodes:
+  - ctx-cluster-01-app-01
+  - ctx-cluster-01-app-02
+  - ctx-cluster-01-app-03
+  - ctx-cluster-01-cp-01
+  - ctx-cluster-01-management
