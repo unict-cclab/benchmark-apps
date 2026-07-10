@@ -214,7 +214,45 @@ spec:
                     values:
                       - management
 {{ end }}
-
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: localai-worker-sidecar
+  namespace: local-ai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: localai-worker-sidecar
+  namespace: local-ai
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["list", "get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "get"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes"]
+    verbs: ["list", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: localai-worker-sidecar
+  namespace: local-ai
+subjects:
+  - kind: ServiceAccount
+    name: localai-worker-sidecar
+    namespace: local-ai
+roleRef:
+  kind: Role
+  name: localai-worker-sidecar
+  apiGroup: rbac.authorization.k8s.io
 # ------------------------------------------------------------------
 # GATEWAY PER-MASTER (nginx)
 # ------------------------------------------------------------------
@@ -226,7 +264,7 @@ metadata:
   namespace: {{ .namespace or "default" }}
   labels:
     group: "{{ .group }}"
-    app: gateway-{{ .group }}
+    component: node-proxy
 data:
   default.conf: |
     server {
@@ -250,16 +288,20 @@ metadata:
   namespace: {{ .namespace or "default" }}
   labels:
     group: "{{ .group }}"
+    component: node-proxy
     app: gateway-{{ .group }}
 spec:
   replicas: 1
   selector:
     matchLabels:
+      group: "{{ .group }}"
+      component: node-proxy
       app: gateway-{{ .group }}
   template:
     metadata:
       labels:
         group: "{{ .group }}"
+        component: node-proxy
         app: gateway-{{ .group }}
     spec:
       schedulerName: {{ .schedulerName }}
@@ -293,15 +335,15 @@ metadata:
   namespace: {{ .namespace or "default" }}
   labels:
     group: "{{ .group }}"
-    app: gateway-{{ .group }}
     component: node-proxy
 spec:
   type: NodePort
   externalTrafficPolicy: Local
   selector:
-    app: gateway-{{ .group }}
+    group: "{{ .group }}"
+    component: node-proxy
   ports:
     - name: http
       port: 80
       targetPort: 8080
-      {{ if .gatewayNodePort }}nodePort: {{ .gatewayNodePort }}{{ end }}
+      {{ if .proxyNodePort }}nodePort: {{ .proxyNodePort }}{{ end }}
