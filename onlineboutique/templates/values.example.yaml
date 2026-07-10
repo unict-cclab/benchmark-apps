@@ -1,6 +1,7 @@
 schedulerName: scheduler-plugins-scheduler
 group: onlineboutique-a
 minReplicas: 2
+proxyNodePort: 0 # 0 = NodePort assegnato da Kubernetes
 hpa:
   enabled: false
   minReplicas: 2

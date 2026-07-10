@@ -1,24 +1,25 @@
-# --- Cluster / Master --------------------------------------------
-group: "cluster-3"                 # id univoco del cluster (usato ovunque come nome/label)
-portbind: 8080                     # porta P2P/gRPC del master
-p2pToken: "CHANGE_ME_p2p_token"    # token generato da generateP2PToken(clusterID)
-schedulerName: "default-scheduler" # nome scheduler k8s (sempre presente nel template)
+# --- Cluster / Master ----------------------------------------------
+group: "cluster-3"                 # ID univoco del cluster, usato in nomi e label
+namespace: "local-ai"              # namespace di tutte le risorse generate
+schedulerName: "default-scheduler" # scheduler usato da master, worker e gateway
+portbind: 8080                      # porta P2P/gRPC del master
+p2pToken: "CHANGE_ME_p2p_token"    # token condiviso da master e worker
 
 masterHostname: ""                 # es. "jetsonorigin" per pinnare il master a un nodo fisso
                                     # lasciare vuoto ("") per lasciare libero lo scheduler
-useGPU: false                      
-models_pvc: "localai-shared-models-pvc"
-backend_pvc: "localai-backend-all-pvc"
-namespace: "local-ai"
+useGPU: false                       # richiede risorse nvidia.com/gpu sul master
+models_pvc: "localai-shared-models-pvc" # default usato anche se vuoto
+backend_pvc: "localai-backend-all-pvc"  # default usato anche se vuoto
+
 # --- Worker ---------------------------------------------------------
 numWorker: 3                       # quanti worker creare (una Deployment per worker)
-workerBasePort: 19300               # porta del worker 0; il worker i-esimo usa workerBasePort+i
+workerBasePort: 19300              # porta del worker 0; il worker i-esimo usa workerBasePort+i
 workerNodeName: ""                 # es. "ds-cluster-worker-02" per pinnare TUTTI i worker a un nodo fisso
                                     # lasciare vuoto ("") per nodeSelector libero ({})
 workerMemoryLimitGi: 0              # 0 o non impostato = nessun limite di memoria
 
-# --- Gateway per-master (nginx) --------------------------------------
-proxyNodePort: 0                
+# --- Gateway per master (NGINX) -------------------------------------
+proxyNodePort: 30090               # deve coincidere con X-Forwarded-Port; 0 = assegnazione automatica
 proxyNodes:
   - ctx-cluster-01-app-01
   - ctx-cluster-01-app-02
