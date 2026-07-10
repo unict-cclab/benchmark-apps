@@ -5,7 +5,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: local-ai-{{ .group }}
-  namespace: {{ .namespace or "default" }}
+  namespace: {{  or .namespace "default" }}
   labels:
     app: {{ .group }}_master
     group: "{{ .group }}"
@@ -84,16 +84,16 @@ spec:
       volumes:
         - name: local-models
           persistentVolumeClaim:
-            claimName:  {{ .models_pvc or "localai-shared-models-pvc"}}
+            claimName:  {{  or .models_pvc "localai-shared-models-pvc"}}
         - name: local-backends
           persistentVolumeClaim:
-            claimName: {{ .backend_pvc or "localai-backend-all-pvc"}}
+            claimName: {{  or .backend_pvc "localai-backend-all-pvc"}}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: local-ai-{{ .group }}
-  namespace: {{ .namespace or "default" }}
+  namespace: {{  or .namespace "default" }}
   labels:
     app: {{ .group }}_master
     group: "{{ .group }}"
@@ -118,7 +118,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: localai-worker-{{ $.group }}-{{ $workerSuffix }}
-  namespace: {{ .namespace or "default" }}
+  namespace: {{  or .namespace "default" }}
   labels:
     app: {{ $.group }}_worker_{{ $workerSuffix }}
     group: "{{ $.group }}"
@@ -201,7 +201,7 @@ spec:
       volumes:
         - name: local-backends
           persistentVolumeClaim:
-            claimName: {{ .backend_pvc or "localai-backend-all-pvc"}}
+            claimName: {{  or .backend_pvc "localai-backend-all-pvc"}}
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -219,13 +219,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: localai-worker-sidecar
-  namespace: local-ai
+  namespace: {{ or .namespace  "default" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: localai-worker-sidecar
-  namespace: local-ai
+  namespace: {{ or .namespace  "default" }}
 rules:
   - apiGroups: [""]
     resources: ["services"]
@@ -244,11 +244,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: localai-worker-sidecar
-  namespace: local-ai
+  namespace: {{ or .namespace  "default" }}
 subjects:
   - kind: ServiceAccount
     name: localai-worker-sidecar
-    namespace: local-ai
+    namespace: {{ or .namespace  "default" }}
 roleRef:
   kind: Role
   name: localai-worker-sidecar
@@ -261,7 +261,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: gateway-{{ .group }}-config
-  namespace: {{ .namespace or "default" }}
+  namespace: {{ or .namespace  "default" }}
   labels:
     group: "{{ .group }}"
     component: node-proxy
@@ -285,7 +285,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gateway-{{ .group }}
-  namespace: {{ .namespace or "default" }}
+  namespace: {{ or .namespace  "default" }}
   labels:
     group: "{{ .group }}"
     component: node-proxy
@@ -332,7 +332,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: node-proxy
-  namespace: {{ .namespace or "default" }}
+  namespace: {{ or .namespace  "default" }}
   labels:
     group: "{{ .group }}"
     component: node-proxy
