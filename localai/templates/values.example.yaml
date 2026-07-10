@@ -9,6 +9,7 @@ masterHostname: ""                 # es. "jetsonorigin" per pinnare il master a 
 useGPU: false                      
 models_pvc: "name pvc model"
 backend_pvc: "name pvc backend"
+namespace: "name namespace"
 # --- Worker ---------------------------------------------------------
 numWorker: 3                       # quanti worker creare (una Deployment per worker)
 workerBasePort: 19300               # porta del worker 0; il worker i-esimo usa workerBasePort+i
