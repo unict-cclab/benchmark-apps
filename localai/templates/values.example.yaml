@@ -1,0 +1,19 @@
+# --- Cluster / Master --------------------------------------------
+group: "cluster-3"                 # id univoco del cluster (usato ovunque come nome/label)
+portbind: 8080                     # porta P2P/gRPC del master
+p2pToken: "CHANGE_ME_p2p_token"    # token generato da generateP2PToken(clusterID)
+schedulerName: "default-scheduler" # nome scheduler k8s (sempre presente nel template)
+
+masterHostname: ""                 # es. "jetsonorigin" per pinnare il master a un nodo fisso
+                                    # lasciare vuoto ("") per lasciare libero lo scheduler
+useGPU: false                      
+
+# --- Worker ---------------------------------------------------------
+numWorker: 3                       # quanti worker creare (una Deployment per worker)
+workerBasePort: 19300               # porta del worker 0; il worker i-esimo usa workerBasePort+i
+workerNodeName: ""                 # es. "ds-cluster-worker-02" per pinnare TUTTI i worker a un nodo fisso
+                                    # lasciare vuoto ("") per nodeSelector libero ({})
+workerMemoryLimitGi: 0              # 0 o non impostato = nessun limite di memoria
+
+# --- Gateway per-master (nginx) --------------------------------------
+gatewayNodePort: 0                
