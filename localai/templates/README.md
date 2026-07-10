@@ -32,7 +32,7 @@ Il template utilizza la sintassi **Go `text/template`** (stile Helm), ad esempio
 | `.workerNodeName` | string | Hostname del nodo su cui schedulare i Worker (opzionale). |
 | `.workerMemoryLimitGi` | int | Limite di memoria per ciascun Worker, espresso in Gi (opzionale). |
 | `.gatewayNodePort` | int | `NodePort` fisso del Gateway (opzionale). |
-
+| `.proxyNode` | map | |
 ---
 
 ## Requisiti

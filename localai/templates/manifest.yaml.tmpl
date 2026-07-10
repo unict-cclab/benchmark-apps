@@ -241,6 +241,7 @@ data:
         proxy_pass http://local-ai-{{ .group }}:8080;
       }
     }
+{{ range .proxyNodes }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -283,6 +284,7 @@ spec:
         - name: nginx-config
           configMap:
             name: gateway-{{ .group }}-config
+{{ end }}
 ---
 apiVersion: v1
 kind: Service
