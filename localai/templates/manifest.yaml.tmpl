@@ -84,10 +84,10 @@ spec:
       volumes:
         - name: local-models
           persistentVolumeClaim:
-            claimName: localai-shared-models-pvc
+            claimName:  {{ .models_pvc or "localai-shared-models-pvc"}}
         - name: local-backends
           persistentVolumeClaim:
-            claimName: localai-backend-all-pvc
+            claimName: {{ .backend_pvc or "localai-backend-all-pvc"}}
 ---
 apiVersion: v1
 kind: Service
@@ -201,7 +201,7 @@ spec:
       volumes:
         - name: local-backends
           persistentVolumeClaim:
-            claimName: localai-backend-all-pvc
+            claimName: {{ .backend_pvc or "localai-backend-all-pvc"}}
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:

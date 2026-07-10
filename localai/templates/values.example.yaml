@@ -7,7 +7,8 @@ schedulerName: "default-scheduler" # nome scheduler k8s (sempre presente nel tem
 masterHostname: ""                 # es. "jetsonorigin" per pinnare il master a un nodo fisso
                                     # lasciare vuoto ("") per lasciare libero lo scheduler
 useGPU: false                      
-
+models_pvc: "name pvc model"
+backend_pvc: "name pvc backend"
 # --- Worker ---------------------------------------------------------
 numWorker: 3                       # quanti worker creare (una Deployment per worker)
 workerBasePort: 19300               # porta del worker 0; il worker i-esimo usa workerBasePort+i
@@ -17,3 +18,9 @@ workerMemoryLimitGi: 0              # 0 o non impostato = nessun limite di memor
 
 # --- Gateway per-master (nginx) --------------------------------------
 gatewayNodePort: 0                
+proxyNodes:
+  - ctx-cluster-01-app-01
+  - ctx-cluster-01-app-02
+  - ctx-cluster-01-app-03
+  - ctx-cluster-01-cp-01
+  - ctx-cluster-01-management
