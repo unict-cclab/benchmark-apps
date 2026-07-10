@@ -9,7 +9,7 @@ masterHostname: ""                 # es. "jetsonorigin" per pinnare il master a 
 useGPU: false                      
 models_pvc: "localai-shared-models-pvc"
 backend_pvc: "localai-backend-all-pvc"
-namespace: "default"
+namespace: "local-ai"
 # --- Worker ---------------------------------------------------------
 numWorker: 3                       # quanti worker creare (una Deployment per worker)
 workerBasePort: 19300               # porta del worker 0; il worker i-esimo usa workerBasePort+i

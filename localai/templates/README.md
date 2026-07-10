@@ -4,7 +4,7 @@ Template Kubernetes per la creazione di un cluster **LocalAI** composto da:
 
 - **1 Master**
 - **N Worker**
-- **1 Gateway NGINX dedicato** (uno per ogni master/cluster)
+- **N Gateway NGINX** (uno per ogni nodo proxy selezionato)
 
 Il template utilizza la sintassi **Go `text/template`** (stile Helm), ad esempio:
 
@@ -22,6 +22,7 @@ Il template utilizza la sintassi **Go `text/template`** (stile Helm), ad esempio
 | Variabile | Tipo | Descrizione |
 |-----------|------|-------------|
 | `.group` | string | Identificativo univoco del cluster (es. `cluster-3`). |
+| `.namespace` | string | Namespace Kubernetes in cui creare tutte le risorse. |
 | `.portbind` | int | Porta P2P/gRPC del Master (es. `8080`). |
 | `.p2pToken` | string | Token P2P generato tramite `generateP2PToken`. |
 | `.masterHostname` | string | Hostname del nodo su cui schedulare il Master. Se vuoto, viene utilizzato lo scheduler Kubernetes. |
@@ -31,8 +32,10 @@ Il template utilizza la sintassi **Go `text/template`** (stile Helm), ad esempio
 | `.numWorker` | int | Numero di Worker da creare (una Deployment per ciascuno). |
 | `.workerNodeName` | string | Hostname del nodo su cui schedulare i Worker (opzionale). |
 | `.workerMemoryLimitGi` | int | Limite di memoria per ciascun Worker, espresso in Gi (opzionale). |
-| `.gatewayNodePort` | int | `NodePort` fisso del Gateway (opzionale). |
-| `.proxyNode` | map | |
+| `.models_pvc` | string | PVC dei modelli; usa `localai-shared-models-pvc` se vuoto. |
+| `.backend_pvc` | string | PVC dei backend; usa `localai-backend-all-pvc` se vuoto. |
+| `.proxyNodePort` | int | `NodePort` fisso del Gateway (opzionale). |
+| `.proxyNodes` | []string | Hostname dei nodi sui quali creare e fissare i Gateway. |
 ---
 
 ## Requisiti
@@ -71,8 +74,8 @@ Le funzioni vengono utilizzate principalmente per:
 
 ```text
                 +----------------------+
-                |     Gateway NGINX    |
-                |  (1 per ogni Master) |
+                |    Gateway NGINX     |
+                | (per proxy node)     |
                 +----------+-----------+
                            |
                            |
@@ -91,4 +94,4 @@ Ogni cluster è completamente indipendente ed è composto da:
 
 - un Master
 - uno o più Worker
-- un Gateway NGINX dedicato
+- un Gateway NGINX per ogni nodo proxy selezionato
