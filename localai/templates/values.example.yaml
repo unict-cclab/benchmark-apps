@@ -18,7 +18,7 @@ workerNodeName: ""                 # es. "ds-cluster-worker-02" per pinnare TUTT
 workerMemoryLimitGi: 0              # 0 o non impostato = nessun limite di memoria
 
 # --- Gateway per-master (nginx) --------------------------------------
-gatewayNodePort: 0                
+proxyNodePort: 0                
 proxyNodes:
   - ctx-cluster-01-app-01
   - ctx-cluster-01-app-02
