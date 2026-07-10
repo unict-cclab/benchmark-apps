@@ -7,9 +7,9 @@ schedulerName: "default-scheduler" # nome scheduler k8s (sempre presente nel tem
 masterHostname: ""                 # es. "jetsonorigin" per pinnare il master a un nodo fisso
                                     # lasciare vuoto ("") per lasciare libero lo scheduler
 useGPU: false                      
-models_pvc: "name pvc model"
-backend_pvc: "name pvc backend"
-namespace: "name namespace"
+models_pvc: "localai-shared-models-pvc"
+backend_pvc: "localai-backend-all-pvc"
+namespace: "default"
 # --- Worker ---------------------------------------------------------
 numWorker: 3                       # quanti worker creare (una Deployment per worker)
 workerBasePort: 19300               # porta del worker 0; il worker i-esimo usa workerBasePort+i
