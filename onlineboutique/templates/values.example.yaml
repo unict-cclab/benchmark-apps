@@ -9,7 +9,7 @@ hpa:
   targetCPUUtilizationPercentage: 70
 cpa:
   enabled: false
-  image: 192.168.1.61/library/custom-pod-autoscaler:latest
+  image: ghcr.io/unict-cclab/custom-pod-autoscaler:v0.0.2
   imagePullPolicy: IfNotPresent
   intervalMillis: 15000
   minReplicas: 2
