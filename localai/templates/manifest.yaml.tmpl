@@ -26,6 +26,7 @@ spec:
         prometheus.io/port: "{{ .portbind }}"
         prometheus.io/path: "/metrics"
         localai-backends-path: "/backends/amd64"
+        localai-model-config: "{{ .modelConfig }}"
     spec:
       schedulerName: {{ .schedulerName }}
       hostNetwork: true
@@ -64,8 +65,10 @@ spec:
           env:
             - name: DEBUG
               value: "true"
-            - name: MODELS
-              value: "[]"
+            - name: LOCALAI_BACKEND_GALLERIES
+              value: '[{"name":"localai","url":"github:mudler/LocalAI/backend/index.yaml@master"}]'
+            - name: LOCALAI_EXTERNAL_BACKENDS
+              value: "llama-cpp"
             - name: LOCALAI_BACKENDS_PATH
               valueFrom:
                 fieldRef:

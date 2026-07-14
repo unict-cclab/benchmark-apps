@@ -10,7 +10,7 @@ masterHostname: ""                 # es. "jetsonorigin" per pinnare il master a 
 useGPU: false                       # richiede risorse nvidia.com/gpu sul master
 models_pvc: "localai-shared-models-pvc" # default usato anche se vuoto
 backend_pvc: "localai-backend-all-pvc"  # default usato anche se vuoto
-
+modelConfig: "llama-3.2-3b.yaml"   # filename in models/ da preloadare sul master (vuoto = nessun preload)
 # --- Worker ---------------------------------------------------------
 numWorker: 3                       # quanti worker creare (una Deployment per worker)
 workerBasePort: 19300              # porta del worker 0; il worker i-esimo usa workerBasePort+i
