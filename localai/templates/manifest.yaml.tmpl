@@ -1,6 +1,20 @@
 # ------------------------------------------------------------------
 # MASTER
 # ------------------------------------------------------------------
+{{ if .modelConfig }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-ai-{{ .group }}-model-config
+  namespace: {{ .namespace }}
+  labels:
+    app: {{ .group }}_master
+    group: "{{ .group }}"
+data:
+  {{ .modelConfig }}: |
+{{ .modelConfigContent | indent 4 }}
+---
+{{ end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,11 +40,9 @@ spec:
         prometheus.io/port: "{{ .portbind }}"
         prometheus.io/path: "/metrics"
         localai-backends-path: "/backends/amd64"
-        localai-model-config: "{{ .modelConfig }}"
     spec:
       schedulerName: {{ .schedulerName }}
       hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
       {{ if .masterHostname }}
       nodeSelector:
         kubernetes.io/hostname: {{ .masterHostname }}
@@ -51,6 +63,21 @@ spec:
       {{ if .useGPU }}
       runtimeClassName: "nvidia"
       {{ end }}
+      {{ if .modelConfig }}
+      initContainers:
+        - name: preload-model-config
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - cp /model-config/{{ .modelConfig }} /models/{{ .modelConfig }}
+          volumeMounts:
+            - name: model-config
+              mountPath: /model-config
+              readOnly: true
+            - name: local-models
+              mountPath: /models
+      {{ end }}
       containers:
         - name: local-ai
           image: localai/localai:master-aio-cpu
@@ -69,6 +96,10 @@ spec:
               value: '[{"name":"localai","url":"github:mudler/LocalAI/backend/index.yaml@master"}]'
             - name: LOCALAI_EXTERNAL_BACKENDS
               value: "llama-cpp"
+            {{ if .modelConfig }}
+            - name: PRELOAD_MODELS
+              value: '[{"url": "file:///models/{{ .modelConfig }}"}]'
+            {{ end }}
             - name: LOCALAI_BACKENDS_PATH
               valueFrom:
                 fieldRef:
@@ -84,6 +115,11 @@ spec:
             - name: local-backends
               mountPath: /backends
       volumes:
+        {{ if .modelConfig }}
+        - name: model-config
+          configMap:
+            name: local-ai-{{ .group }}-model-config
+        {{ end }}
         - name: local-models
           persistentVolumeClaim:
             claimName: {{ or .models_pvc "localai-shared-models-pvc" }}
