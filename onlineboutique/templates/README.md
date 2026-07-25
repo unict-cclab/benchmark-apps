@@ -10,6 +10,8 @@ optional HPA or Custom Pod Autoscaler resources.
 | `group` | string | Identifier used in labels and selectors |
 | `schedulerName` | string | Scheduler used by application and gateway Pods |
 | `minReplicas` | int | Initial replicas for application Deployments |
+| `cpuRequest` | string | CPU request shared by all application microservices |
+| `memoryRequest` | string | Memory request shared by all application microservices |
 | `proxyNodes` | list | Nodes hosting gateway Deployments |
 | `proxyNodePort` | int | Fixed gateway NodePort; `0` requests automatic allocation |
 | `hpa.enabled` | bool | Generates HorizontalPodAutoscalers |

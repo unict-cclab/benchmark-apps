@@ -83,8 +83,8 @@ spec:
             port: 7000
         resources:
           requests:
-            cpu: 100m
-            memory: 64Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
 ---
 apiVersion: v1
 kind: Service
@@ -269,8 +269,8 @@ spec:
             port: 3550
         resources:
           requests:
-            cpu: 100m
-            memory: 64Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
 ---
 apiVersion: v1
 kind: Service
@@ -367,8 +367,8 @@ spec:
             value: "cartservice:7070"
           resources:
             requests:
-              cpu: 100m
-              memory: 64Mi
+              cpu: {{ .cpuRequest }}
+              memory: {{ .memoryRequest }}
 ---
 apiVersion: v1
 kind: Service
@@ -456,8 +456,8 @@ spec:
             port: 50051
         resources:
           requests:
-            cpu: 100m
-            memory: 64Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
 ---
 apiVersion: v1
 kind: Service
@@ -537,8 +537,8 @@ spec:
           value: "redis-cart:6379"
         resources:
           requests:
-            cpu: 200m
-            memory: 64Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
         readinessProbe:
           initialDelaySeconds: 15
           grpc:
@@ -633,8 +633,8 @@ spec:
           name: redis-data
         resources:
           requests:
-            cpu: 70m
-            memory: 200Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
       volumes:
       - name: redis-data
         emptyDir: {}
@@ -724,8 +724,8 @@ spec:
             port: 8080
         resources:
           requests:
-            cpu: 100m
-            memory: 64Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
 ---
 apiVersion: v1
 kind: Service
@@ -813,8 +813,8 @@ spec:
             port: 50051
         resources:
           requests:
-            cpu: 100m
-            memory: 64Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
 ---
 apiVersion: v1
 kind: Service
@@ -942,8 +942,8 @@ spec:
           #   value: "" # This value would look like "http://123.123.123"
           resources:
             requests:
-              cpu: 100m
-              memory: 64Mi
+              cpu: {{ .cpuRequest }}
+              memory: {{ .memoryRequest }}
 ---
 apiVersion: v1
 kind: Service
@@ -1037,8 +1037,8 @@ spec:
           value: "1"
         resources:
           requests:
-            cpu: 100m
-            memory: 220Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
 ---
 apiVersion: v1
 kind: Service
@@ -1118,8 +1118,8 @@ spec:
           value: "9555"
         resources:
           requests:
-            cpu: 200m
-            memory: 180Mi
+            cpu: {{ .cpuRequest }}
+            memory: {{ .memoryRequest }}
         readinessProbe:
           initialDelaySeconds: 20
           periodSeconds: 15
