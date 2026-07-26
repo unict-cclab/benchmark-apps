@@ -1568,6 +1568,8 @@ spec:
     value: "{{ $.cpa.prometheusURL }}"
   - name: TARGET_RESPONSE_TIME
     value: "{{ $.cpa.targetResponseTimeMillis }}"
+  - name: EXCLUDE_OUTBOUND_RESPONSE_TIME
+    value: "{{ $.cpa.excludeOutboundResponseTime }}"
   - name: TARGET_PERCENTAGE
     value: "{{ $.cpa.targetPercentage }}"
   - name: TIME_RANGE

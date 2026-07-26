@@ -18,6 +18,7 @@ cpa:
   maxReplicas: 10
   prometheusURL: http://prometheus-kube-prometheus-prometheus.observability:9090/api/v1/query
   targetResponseTimeMillis: 250
+  excludeOutboundResponseTime: false
   targetPercentage: 0.95
   timeRange: 1m
   redisImage: redis:7.4-alpine

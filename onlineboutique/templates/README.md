@@ -26,6 +26,7 @@ optional HPA or Custom Pod Autoscaler resources.
 | `cpa.maxReplicas` | int | CPA maximum replicas |
 | `cpa.prometheusURL` | string | Prometheus query endpoint |
 | `cpa.targetResponseTimeMillis` | number | Target response time |
+| `cpa.excludeOutboundResponseTime` | bool | Ignore outbound response time and use inbound response time directly |
 | `cpa.targetPercentage` | number | Target percentile |
 | `cpa.timeRange` | string | Prometheus query range |
 | `cpa.redisImage` | string | Redis image |
