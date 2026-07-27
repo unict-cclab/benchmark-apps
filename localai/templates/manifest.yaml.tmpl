@@ -373,7 +373,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: node-proxy
+  name: node-proxy-{{ .group }}
   namespace: {{ .namespace }}
   labels:
     group: "{{ .group }}"
