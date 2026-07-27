@@ -17,7 +17,7 @@ optional HPA or Custom Pod Autoscaler resources.
 | `hpa.enabled` | bool | Generates HorizontalPodAutoscalers |
 | `hpa.minReplicas` | int | HPA minimum replicas |
 | `hpa.maxReplicas` | int | HPA maximum replicas |
-| `hpa.targetCPUUtilizationPercentage` | int | HPA CPU target |
+| `hpa.targetCPUAverageValue` | string | Absolute average HPA CPU target as a Kubernetes quantity |
 | `cpa.enabled` | bool | Generates CustomPodAutoscalers and Redis |
 | `cpa.image` | string | Autoscaler image |
 | `cpa.imagePullPolicy` | string | Autoscaler image pull policy |
