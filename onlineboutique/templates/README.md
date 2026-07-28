@@ -33,6 +33,7 @@ optional HPA or Custom Pod Autoscaler resources.
 | `cpa.redisHost` | string | Redis Service hostname |
 | `cpa.kp`, `cpa.ki`, `cpa.kd` | number | PID coefficients |
 | `cpa.downscaleStabilization` | int | Downscale stabilization in seconds |
+| `cpa.marginRatio` | number | Fractional margin between RPS-per-replica bounds in `(0, 1)` |
 
 Do not enable HPA and CPA together. See
 [`values.example.yaml`](values.example.yaml) for a complete input.

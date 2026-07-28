@@ -27,6 +27,7 @@ cpa:
   ki: 0
   kd: 0
   downscaleStabilization: 300
+  marginRatio: 0.1
 proxyNodes:
   - ctx-cluster-01-app-01
   - ctx-cluster-01-app-02
