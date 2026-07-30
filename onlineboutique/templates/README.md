@@ -1,7 +1,7 @@
 # Online Boutique template
 
-Go `text/template` manifest for Online Boutique, node-pinned gateways, and
-optional HPA or Custom Pod Autoscaler resources.
+Go `text/template` manifest for Online Boutique, node-pinned gateways, and one
+optional autoscaler implementation.
 
 ## Parameters
 
@@ -14,26 +14,27 @@ optional HPA or Custom Pod Autoscaler resources.
 | `memoryRequest` | string | Memory request shared by all application microservices |
 | `proxyNodes` | list | Nodes hosting gateway Deployments |
 | `proxyNodePort` | int | Fixed gateway NodePort; `0` requests automatic allocation |
-| `hpa.enabled` | bool | Generates HorizontalPodAutoscalers |
-| `hpa.minReplicas` | int | HPA minimum replicas |
-| `hpa.maxReplicas` | int | HPA maximum replicas |
-| `hpa.targetCPUAverageValue` | string | Absolute average HPA CPU target as a Kubernetes quantity |
-| `cpa.enabled` | bool | Generates CustomPodAutoscalers and Redis |
-| `cpa.image` | string | Autoscaler image |
-| `cpa.imagePullPolicy` | string | Autoscaler image pull policy |
-| `cpa.intervalMillis` | int | Control interval in milliseconds |
-| `cpa.minReplicas` | int | CPA minimum replicas |
-| `cpa.maxReplicas` | int | CPA maximum replicas |
-| `cpa.prometheusURL` | string | Prometheus query endpoint |
-| `cpa.targetResponseTimeMillis` | number | Target response time |
-| `cpa.excludeOutboundResponseTime` | bool | Ignore outbound response time and use inbound response time directly |
-| `cpa.targetPercentage` | number | Target percentile |
-| `cpa.timeRange` | string | Prometheus query range |
-| `cpa.redisImage` | string | Redis image |
-| `cpa.redisHost` | string | Redis Service hostname |
-| `cpa.kp`, `cpa.ki`, `cpa.kd` | number | PID coefficients |
-| `cpa.downscaleStabilization` | int | Downscale stabilization in seconds |
-| `cpa.marginRatio` | number | Fractional margin between RPS-per-replica bounds in `(0, 1)` |
+| `autoscaler.hpa.config` | map | HPA configuration rendered and validated by this template |
+| `autoscaler.cpa.plugin` | string | Plugin name passed to the CPA container |
+| `autoscaler.cpa.config` | map | CPA renderer configuration |
 
-Do not enable HPA and CPA together. See
-[`values.example.yaml`](values.example.yaml) for a complete input.
+The HPA config requires `minReplicas`, `maxReplicas`, and a native Kubernetes
+`metrics` list. Its optional `targets` list overrides the application-specific
+default workloads.
+
+The Sophos CPA config uses a flat camelCase schema. It requires `image`,
+`intervalMillis`, `minReplicas`, `maxReplicas`, `prometheusURL`,
+`targetResponseTimeMillis`, `targetPercentage`, `timeRange`, `redisImage`,
+`redisHost`, `kp`, `ki`, `kd`, `downscaleStabilizationSeconds`, and
+`marginRatio`. `excludeOutboundResponseTime` defaults to `false`,
+`imagePullPolicy` defaults to `IfNotPresent`, and `targets` can override the
+default workloads.
+
+The renderer validates these fields and translates them to the uppercase
+configuration names consumed internally by the Sophos container. Environment
+variable names are therefore not part of the public template contract.
+
+The renderer rejects multiple autoscaler implementations, unknown
+implementations, unsupported CPA plugins, missing fields, invalid numeric
+ranges, and invalid replica bounds. See
+[`values.example.yaml`](values.example.yaml) for a complete Sophos input.

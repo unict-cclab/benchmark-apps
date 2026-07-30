@@ -1306,8 +1306,18 @@ spec:
     matchLabels:
       group: {{ .group }}
       app: adservice
-{{ if .hpa.enabled }}
-{{ range .hpaServices }}
+{{ if gt (len .autoscaler) 1 }}{{ fail "autoscaler must configure exactly one implementation" }}{{ end }}
+{{ $hpa := index .autoscaler "hpa" }}
+{{ $cpa := index .autoscaler "cpa" }}
+{{ if and (eq (len .autoscaler) 1) (not $hpa) (not $cpa) }}{{ fail "unsupported autoscaler implementation: expected hpa or cpa" }}{{ end }}
+{{ if $hpa }}
+{{ $hpaConfig := required "autoscaler.hpa.config" (index $hpa "config") }}
+{{ $hpaMinReplicas := required "autoscaler.hpa.config.minReplicas" (index $hpaConfig "minReplicas") }}
+{{ $hpaMaxReplicas := required "autoscaler.hpa.config.maxReplicas" (index $hpaConfig "maxReplicas") }}
+{{ if or (lt $hpaMinReplicas 1) (lt $hpaMaxReplicas $hpaMinReplicas) }}{{ fail "autoscaler.hpa replicas must satisfy 1 <= minReplicas <= maxReplicas" }}{{ end }}
+{{ $hpaMetrics := required "autoscaler.hpa.config.metrics" (index $hpaConfig "metrics") }}
+{{ $hpaTargets := or (index $hpaConfig "targets") (list "currencyservice" "productcatalogservice" "checkoutservice" "shippingservice" "cartservice" "redis-cart" "emailservice" "paymentservice" "frontend" "recommendationservice" "adservice") }}
+{{ range $hpaTargets }}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -1321,23 +1331,42 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: {{ . }}
-  minReplicas: {{ $.hpa.minReplicas }}
-  maxReplicas: {{ $.hpa.maxReplicas }}
+  minReplicas: {{ $hpaMinReplicas }}
+  maxReplicas: {{ $hpaMaxReplicas }}
   metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: AverageValue
-        averageValue: {{ $.hpa.targetCPUAverageValue }}
+{{ toYaml $hpaMetrics | indent 4 }}
 {{ end }}
 {{ end }}
-{{ if .cpa.enabled }}
+{{ if $cpa }}
+{{ $cpaPlugin := required "autoscaler.cpa.plugin" (index $cpa "plugin") }}
+{{ if ne $cpaPlugin "sophos" }}{{ fail (printf "unsupported CPA plugin: %s" $cpaPlugin) }}{{ end }}
+{{ $cpaConfig := required "autoscaler.cpa.config" (index $cpa "config") }}
+{{ $cpaImage := required "autoscaler.cpa.config.image" (index $cpaConfig "image") }}
+{{ $cpaInterval := required "autoscaler.cpa.config.intervalMillis" (index $cpaConfig "intervalMillis") }}
+{{ $cpaMinReplicas := required "autoscaler.cpa.config.minReplicas" (index $cpaConfig "minReplicas") }}
+{{ $cpaMaxReplicas := required "autoscaler.cpa.config.maxReplicas" (index $cpaConfig "maxReplicas") }}
+{{ if or (lt $cpaMinReplicas 1) (lt $cpaMaxReplicas $cpaMinReplicas) }}{{ fail "autoscaler.cpa replicas must satisfy 1 <= minReplicas <= maxReplicas" }}{{ end }}
+{{ validatePositive "autoscaler.cpa.config.intervalMillis" $cpaInterval }}
+{{ $prometheusURL := required "autoscaler.cpa.config.prometheusURL" (index $cpaConfig "prometheusURL") }}
+{{ $targetResponseTime := required "autoscaler.cpa.config.targetResponseTimeMillis" (index $cpaConfig "targetResponseTimeMillis") }}
+{{ validatePositive "autoscaler.cpa.config.targetResponseTimeMillis" $targetResponseTime }}
+{{ $targetPercentage := required "autoscaler.cpa.config.targetPercentage" (index $cpaConfig "targetPercentage") }}
+{{ validateOpenRange "autoscaler.cpa.config.targetPercentage" $targetPercentage 0.0 1.0 }}
+{{ $timeRange := required "autoscaler.cpa.config.timeRange" (index $cpaConfig "timeRange") }}
+{{ $redisImage := required "autoscaler.cpa.config.redisImage" (index $cpaConfig "redisImage") }}
+{{ $redisHost := required "autoscaler.cpa.config.redisHost" (index $cpaConfig "redisHost") }}
+{{ $kp := required "autoscaler.cpa.config.kp" (index $cpaConfig "kp") }}
+{{ $ki := required "autoscaler.cpa.config.ki" (index $cpaConfig "ki") }}
+{{ $kd := required "autoscaler.cpa.config.kd" (index $cpaConfig "kd") }}
+{{ $downscaleStabilization := required "autoscaler.cpa.config.downscaleStabilizationSeconds" (index $cpaConfig "downscaleStabilizationSeconds") }}
+{{ validateNonNegative "autoscaler.cpa.config.downscaleStabilizationSeconds" $downscaleStabilization }}
+{{ $marginRatio := required "autoscaler.cpa.config.marginRatio" (index $cpaConfig "marginRatio") }}
+{{ validateOpenRange "autoscaler.cpa.config.marginRatio" $marginRatio 0.0 1.0 }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: custom-pod-autoscaler-redis
+  name: {{ $redisHost }}
   labels:
     group: {{ .group }}
     app: custom-pod-autoscaler-redis
@@ -1366,7 +1395,7 @@ spec:
                 - app
       containers:
       - name: redis
-        image: {{ .cpa.redisImage }}
+        image: {{ $redisImage }}
         ports:
         - name: redis
           containerPort: 6379
@@ -1381,7 +1410,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: custom-pod-autoscaler-redis
+  name: {{ $redisHost }}
   labels:
     group: {{ .group }}
     app: custom-pod-autoscaler-redis
@@ -1394,7 +1423,8 @@ spec:
   - name: redis
     port: 6379
     targetPort: 6379
-{{ range .cpaServices }}
+{{ $cpaTargets := or (index $cpaConfig "targets") (list "currencyservice" "productcatalogservice" "checkoutservice" "shippingservice" "cartservice" "emailservice" "paymentservice" "frontend" "recommendationservice" "adservice") }}
+{{ range $cpaTargets }}
 ---
 apiVersion: custompodautoscaler.com/v1
 kind: CustomPodAutoscaler
@@ -1408,45 +1438,47 @@ spec:
     spec:
       containers:
       - name: custom-pod-autoscaler
-        image: {{ $.cpa.image }}
-        imagePullPolicy: {{ $.cpa.imagePullPolicy }}
+        image: {{ $cpaImage }}
+        imagePullPolicy: {{ or (index $cpaConfig "imagePullPolicy") "IfNotPresent" }}
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: {{ . }}
   config:
   - name: interval
-    value: "{{ $.cpa.intervalMillis }}"
+    value: "{{ $cpaInterval }}"
   - name: minReplicas
-    value: "{{ $.cpa.minReplicas }}"
+    value: "{{ $cpaMinReplicas }}"
   - name: maxReplicas
-    value: "{{ $.cpa.maxReplicas }}"
+    value: "{{ $cpaMaxReplicas }}"
+  - name: AUTOSCALER_PLUGIN
+    value: "{{ $cpaPlugin }}"
   - name: PROMETHEUS_URL
-    value: "{{ $.cpa.prometheusURL }}"
+    value: "{{ $prometheusURL }}"
   - name: TARGET_RESPONSE_TIME
-    value: "{{ $.cpa.targetResponseTimeMillis }}"
+    value: "{{ $targetResponseTime }}"
   - name: EXCLUDE_OUTBOUND_RESPONSE_TIME
-    value: "{{ $.cpa.excludeOutboundResponseTime }}"
+    value: "{{ or (index $cpaConfig "excludeOutboundResponseTime") false }}"
   - name: TARGET_PERCENTAGE
-    value: "{{ $.cpa.targetPercentage }}"
+    value: "{{ $targetPercentage }}"
   - name: TIME_RANGE
-    value: "{{ $.cpa.timeRange }}"
+    value: "{{ $timeRange }}"
   - name: REDIS_HOST
-    value: "{{ $.cpa.redisHost }}"
+    value: "{{ $redisHost }}"
   - name: MIN_REPLICAS
-    value: "{{ $.cpa.minReplicas }}"
+    value: "{{ $cpaMinReplicas }}"
   - name: MAX_REPLICAS
-    value: "{{ $.cpa.maxReplicas }}"
+    value: "{{ $cpaMaxReplicas }}"
   - name: KP
-    value: "{{ $.cpa.kp }}"
+    value: "{{ $kp }}"
   - name: KI
-    value: "{{ $.cpa.ki }}"
+    value: "{{ $ki }}"
   - name: KD
-    value: "{{ $.cpa.kd }}"
+    value: "{{ $kd }}"
   - name: DOWNSCALE_STABILIZATION
-    value: "{{ $.cpa.downscaleStabilization }}"
+    value: "{{ $downscaleStabilization }}"
   - name: MARGIN_RATIO
-    value: "{{ $.cpa.marginRatio }}"
+    value: "{{ $marginRatio }}"
 {{ end }}
 {{ end }}
 ---
