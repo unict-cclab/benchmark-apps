@@ -1339,7 +1339,6 @@ spec:
 {{ end }}
 {{ if $cpa }}
 {{ $cpaPlugin := required "autoscaler.cpa.plugin" (index $cpa "plugin") }}
-{{ if ne $cpaPlugin "sophos" }}{{ fail (printf "unsupported CPA plugin: %s" $cpaPlugin) }}{{ end }}
 {{ $cpaConfig := required "autoscaler.cpa.config" (index $cpa "config") }}
 {{ $cpaImage := required "autoscaler.cpa.config.image" (index $cpaConfig "image") }}
 {{ $cpaInterval := required "autoscaler.cpa.config.intervalMillis" (index $cpaConfig "intervalMillis") }}
@@ -1350,9 +1349,12 @@ spec:
 {{ $prometheusURL := required "autoscaler.cpa.config.prometheusURL" (index $cpaConfig "prometheusURL") }}
 {{ $targetResponseTime := required "autoscaler.cpa.config.targetResponseTimeMillis" (index $cpaConfig "targetResponseTimeMillis") }}
 {{ validatePositive "autoscaler.cpa.config.targetResponseTimeMillis" $targetResponseTime }}
-{{ $targetPercentage := required "autoscaler.cpa.config.targetPercentage" (index $cpaConfig "targetPercentage") }}
+{{ $targetPercentage := default 0.95 (index $cpaConfig "targetPercentage") }}
+{{ $timeRange := default "1m" (index $cpaConfig "timeRange") }}
 {{ validateOpenRange "autoscaler.cpa.config.targetPercentage" $targetPercentage 0.0 1.0 }}
-{{ $timeRange := required "autoscaler.cpa.config.timeRange" (index $cpaConfig "timeRange") }}
+{{ $timeRange = required "autoscaler.cpa.config.timeRange" $timeRange }}
+{{ $cpaTargets := or (index $cpaConfig "targets") (list "currencyservice" "productcatalogservice" "checkoutservice" "shippingservice" "cartservice" "emailservice" "paymentservice" "frontend" "recommendationservice" "adservice") }}
+{{ if eq $cpaPlugin "sophos" }}
 {{ $redisImage := required "autoscaler.cpa.config.redisImage" (index $cpaConfig "redisImage") }}
 {{ $redisHost := required "autoscaler.cpa.config.redisHost" (index $cpaConfig "redisHost") }}
 {{ $kp := required "autoscaler.cpa.config.kp" (index $cpaConfig "kp") }}
@@ -1423,7 +1425,23 @@ spec:
   - name: redis
     port: 6379
     targetPort: 6379
-{{ $cpaTargets := or (index $cpaConfig "targets") (list "currencyservice" "productcatalogservice" "checkoutservice" "shippingservice" "cartservice" "emailservice" "paymentservice" "frontend" "recommendationservice" "adservice") }}
+{{ else if eq $cpaPlugin "polaris" }}
+{{ $downscaleStabilization := required "autoscaler.cpa.config.downscaleStabilizationSeconds" (index $cpaConfig "downscaleStabilizationSeconds") }}
+{{ validateNonNegative "autoscaler.cpa.config.downscaleStabilizationSeconds" $downscaleStabilization }}
+{{ else }}
+{{ fail (printf "unsupported CPA plugin: %s" $cpaPlugin) }}
+{{ end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoscaler-{{ .group }}-config
+  labels:
+    group: {{ .group }}
+    component: custom-pod-autoscaler-config
+data:
+  config.json: |
+    {"plugin":{{ printf "%q" $cpaPlugin }},"config":{{ toJson $cpaConfig }}}
 {{ range $cpaTargets }}
 ---
 apiVersion: custompodautoscaler.com/v1
@@ -1440,6 +1458,14 @@ spec:
       - name: custom-pod-autoscaler
         image: {{ $cpaImage }}
         imagePullPolicy: {{ or (index $cpaConfig "imagePullPolicy") "IfNotPresent" }}
+        volumeMounts:
+        - name: plugin-config
+          mountPath: /etc/custom-pod-autoscaler
+          readOnly: true
+      volumes:
+      - name: plugin-config
+        configMap:
+          name: autoscaler-{{ $.group }}-config
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
@@ -1451,34 +1477,6 @@ spec:
     value: "{{ $cpaMinReplicas }}"
   - name: maxReplicas
     value: "{{ $cpaMaxReplicas }}"
-  - name: AUTOSCALER_PLUGIN
-    value: "{{ $cpaPlugin }}"
-  - name: PROMETHEUS_URL
-    value: "{{ $prometheusURL }}"
-  - name: TARGET_RESPONSE_TIME
-    value: "{{ $targetResponseTime }}"
-  - name: EXCLUDE_OUTBOUND_RESPONSE_TIME
-    value: "{{ or (index $cpaConfig "excludeOutboundResponseTime") false }}"
-  - name: TARGET_PERCENTAGE
-    value: "{{ $targetPercentage }}"
-  - name: TIME_RANGE
-    value: "{{ $timeRange }}"
-  - name: REDIS_HOST
-    value: "{{ $redisHost }}"
-  - name: MIN_REPLICAS
-    value: "{{ $cpaMinReplicas }}"
-  - name: MAX_REPLICAS
-    value: "{{ $cpaMaxReplicas }}"
-  - name: KP
-    value: "{{ $kp }}"
-  - name: KI
-    value: "{{ $ki }}"
-  - name: KD
-    value: "{{ $kd }}"
-  - name: DOWNSCALE_STABILIZATION
-    value: "{{ $downscaleStabilization }}"
-  - name: MARGIN_RATIO
-    value: "{{ $marginRatio }}"
 {{ end }}
 {{ end }}
 ---
