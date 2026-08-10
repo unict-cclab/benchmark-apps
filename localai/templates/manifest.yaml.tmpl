@@ -236,6 +236,8 @@ spec:
               value: "{{ $.p2pToken }}"
             - name: CLUSTER_ID
               value: "{{ $.group }}"
+            - name: MASTER_NAMESPACE
+              value: "{{ $.namespace }}"
       volumes:
         - name: local-backends
           persistentVolumeClaim:
