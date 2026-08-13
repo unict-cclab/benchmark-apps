@@ -5,6 +5,7 @@ from locust import FastHttpUser, TaskSet, between
 
 MODEL = os.getenv("MODEL_NAME", "qwen_qwen3.5-0.8b")
 CLUSTER_ID = os.getenv("CLUSTER_ID", "cluster-1")
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "100"))
 
 long_context = "Questo è un test di contesto. " * 10 + "/no_think"
 
@@ -14,7 +15,7 @@ def ask_llm(l):
         "model": MODEL,
         "messages": [{"role": "user", "content": long_context}],
         "temperature": 0.7,
-        "max_tokens": 600,
+        "max_tokens": MAX_TOKENS,
     }
     l.client.post(
         "/v1/chat/completions",
