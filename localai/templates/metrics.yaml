@@ -2,19 +2,10 @@ metrics:
   - name: node_memory_peak
     title: "Peak node memory usage"
     unit: "GiB"
-    type: node          # aggrega per nodo
-    query: 'max_over_time((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)[{{.range}}:]) / 1024 / 1024 / 1024'
-    plot: bar
-
+    query: 'max_over_time((node_memory_MemTotal_bytes{instance=~"{{.nodes}}"} - node_memory_MemAvailable_bytes{instance=~"{{.nodes}}"})[{{.range}}:]) / 1073741824'
+    labelKey: instance
   - name: pod_memory_peak
     title: "Peak pod memory by pod"
     unit: "MiB"
-    type: pod           # aggrega per pod
-    query: 'max_over_time(container_memory_working_set_bytes{namespace="{{.namespace}}", pod=~"local-ai-{{.group}}.*|localai-worker-{{.group}}.*"}[{{.range}}:]) / 1024 / 1024'
-    plot: bar
-
-  - name: pod_placement
-    title: "Pod placement (node per pod)"
-    type: placement     # tipo speciale: mappa pod→nodo, non una metrica numerica
-    query: 'kube_pod_info{namespace="{{.namespace}}", pod=~"local-ai-{{.group}}.*|localai-worker-{{.group}}.*"}'
-    plot: table
+    query: 'max_over_time(container_memory_working_set_bytes{namespace="{{.namespace}}", pod=~"(local-ai-{{.group}}|localai-worker-{{.group}}).*", container!=""}[{{.range}}:]) / 1048576'
+    labelKey: pod
