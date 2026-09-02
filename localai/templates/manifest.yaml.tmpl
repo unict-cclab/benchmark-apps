@@ -252,6 +252,19 @@ spec:
                 operator: In
                 values:
                 - app
+      podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: group
+                operator: In
+                values:
+                - "{{ $.group }}"
+              - key: role
+                operator: In
+                values:
+                - master
+            topologyKey: kubernetes.io/hostname
 {{ end }}
 ---
 apiVersion: v1
