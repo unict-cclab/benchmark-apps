@@ -1,0 +1,35 @@
+
+# --- Identità / scheduling ------------------------------------------
+group: "localai-dist"                    
+namespace: "default"                     
+schedulerName: "scheduler-plugins-scheduler"   
+
+# in questo caso non e proprio un p2ptoken ma solo un token , ma tengo lo stesso nome
+p2pToken: "CHANGE_ME_una_stringa_lunga_e_casuale"
+
+# --- Worker -------------------------------------------------------------
+numWorker: 2                              
+workerNodeName: ""                       
+workerMemoryLimitGi: 0                   
+
+# --- Volumi ---------------------------------------------------------------
+models_pvc: "localai-shared-models-pvc"   # montata SOLO sul frontend (i worker ricevono i pesi via staging HTTP)
+backend_pvc: "localai-backend-all-pvc"    # montata sui worker: backend pre-installati in /backends/amd64
+
+
+modelConfig: "qwen3.5-0.8b.yaml"
+
+
+proxyNodes:
+  - "ctx-cluster-01-app-zone-a-01"
+  - "ctx-cluster-01-app-zone-a-02"
+  - "ctx-cluster-01-app-zone-b-01"
+  - "ctx-cluster-01-app-zone-b-02"
+proxyNodePort: 30082                      # 0/assente = NodePort assegnato da k8s; diverso da quello delle app P2P
+
+# --- Chiavi OPZIONALI (lette con `index`: se mancano il render non fallisce) ---
+# Oggi renderApplication() non le mette nella mappa, quindi valgono i default.
+# registrationToken: ""     # default: p2pToken
+# apiKey: ""                # default: p2pToken
+# frontendReplicas: 1       # default: 1
+# modelScheduling: '[{"model_name":"qwen3.5-0.8b","min_replicas":1,"max_replicas":2}]'

@@ -1,0 +1,52 @@
+name: localai-distributed          # nome univoco -> ConfigDir/RunsDir separati
+runs: 1
+
+lifecycle:
+  cluster: reuse                   # "existing" se giri in parallelo ad altri esperimenti
+
+tools:
+  application:
+    name: localai-distributed
+    template: ../../../benchmark-apps/localai-distributed/templates/manifest.yaml.tmpl
+    namespace: default             # stesso namespace delle PVC (le PVC sono namespaced)
+    group: localai-dist            # diverso da quello delle app P2P
+    schedulerName: scheduler-plugins-scheduler   # "default-scheduler" per il baseline
+    namespaceLabels:               # VERIFICA: stesse label del tuo esperimento LocalAI
+      istio-injection: enabled
+      mon-agent/enabled: "true"
+
+    p2pToken: CHANGE_ME_una_stringa_lunga_e_casuale
+
+    numWorker: 2
+    models_pvc: localai-shared-models-pvc
+    backend_pvc: localai-backend-all-pvc
+    modelConfig: qwen3.5-0.8b.yaml # file in ./models/
+
+    proxyNodes: all
+    proxyNodePort: 30082           # diverso da 30080/30081 delle app P2P
+
+
+    portbind: 8090
+    workerBasePort: 19500
+    minReplicas: 1
+    hpa:
+      enabled: false
+    cpa:
+      enabled: false
+
+
+  schedulerPlugins:
+    enabled: true                  # false per il run baseline con default-scheduler
+    # ... resto della config identico al P2P
+
+  descheduler:
+    enabled: false                 
+
+  chaosInjector:
+    enabled: true
+    nodeSelector: nodepool=app     
+    # ... zoneLinks / latenze identici al P2P
+
+  loadGen:
+    enabled: true                  
+    config: ../localai/loadgen/localai.yaml   
