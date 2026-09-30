@@ -1,0 +1,11 @@
+metrics:
+  - name: node_memory_peak
+    title: "Peak node memory usage"
+    unit: "GiB"
+    query: 'max_over_time((node_memory_MemTotal_bytes{instance=~"{{.nodes}}"} - node_memory_MemAvailable_bytes{instance=~"{{.nodes}}"})[{{.range}}:]) / 1073741824'
+    labelKey: instance
+  - name: pod_memory_peak
+    title: "Peak pod memory by pod"
+    unit: "MiB"
+    query: 'max_over_time(container_memory_working_set_bytes{namespace="{{.namespace}}", pod=~"(local-ai-{{.group}}|localai-worker-{{.group}}).*", container!=""}[{{.range}}:]) / 1048576'
+    labelKey: pod

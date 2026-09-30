@@ -1,0 +1,502 @@
+# ==================================================================
+# LocalAI "Distributed Mode" (PostgreSQL + NATS + SmartRouter)
+# benchmark-apps/localai-distributed/templates/manifest.yaml.tmpl
+#
+# Compatibile con la mappa `values` ESISTENTE di renderApplication()
+# (nessuna modifica Go necessaria). Chiavi usate:
+#   .group .namespace .schedulerName .numWorker .workerNodeName
+#   .workerMemoryLimitGi .models_pvc .backend_pvc .p2pToken .proxyNodes
+# Chiavi OPZIONALI lette con `index` (se mancano non rompono il render
+# anche con missingkey=error):
+#   registrationToken  (default: p2pToken)
+#   apiKey             (default: p2pToken)
+#   frontendReplicas   (default: 1)
+#   modelScheduling    (JSON su una riga per LOCALAI_MODEL_SCHEDULING)
+#   proxyNodePort / gatewayNodePort (NodePort fisso del gateway)
+#
+# FuncMap richiesto: until, add, indent (gli stessi del template P2P).
+# ==================================================================
+
+{{ $token := or (index . "registrationToken") .p2pToken }}
+{{ $apiKey := or (index . "apiKey") .p2pToken }}
+{{ $nodePort := or (index . "proxyNodePort") (index . "gatewayNodePort") }}
+
+# ------------------------------------------------------------------
+# POSTGRES (control plane + agent pool su DUE database distinti)
+# Fuori dal mesh Istio: è infrastruttura, non oggetto di misura.
+# ------------------------------------------------------------------
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localai-pg-init-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+data:
+  01-agents-db.sql: |
+    CREATE DATABASE localai_agents OWNER localai;
+    GRANT pg_read_all_stats TO localai;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: localai-pg-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    role: control-plane-db
+spec:
+  serviceName: localai-pg-{{ .group }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .group }}_pg
+  template:
+    metadata:
+      labels:
+        app: {{ .group }}_pg
+        group: "{{ .group }}"
+        role: control-plane-db
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      schedulerName: {{ .schedulerName }}
+      containers:
+        - name: postgres
+          image: quay.io/mudler/localrecall:v0.5.5-postgresql
+          env:
+            - { name: POSTGRES_DB, value: "localai" }
+            - { name: POSTGRES_USER, value: "localai" }
+            - { name: POSTGRES_PASSWORD, value: "localai" }
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "localai"]
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+      volumes:
+        - name: data
+          emptyDir: {}          # stato effimero: ogni run riparte pulito
+        - name: init
+          configMap:
+            name: localai-pg-init-{{ .group }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: localai-pg-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+spec:
+  selector:
+    app: {{ .group }}_pg
+  ports:
+    - { name: tcp-pg, port: 5432, targetPort: 5432 }
+
+# ------------------------------------------------------------------
+# NATS (bus di controllo)
+# ------------------------------------------------------------------
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localai-nats-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    role: control-plane-bus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .group }}_nats
+  template:
+    metadata:
+      labels:
+        app: {{ .group }}_nats
+        group: "{{ .group }}"
+        role: control-plane-bus
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      schedulerName: {{ .schedulerName }}
+      containers:
+        - name: nats
+          image: nats:2-alpine
+          args: ["--js", "-m", "8222"]
+          ports:
+            - containerPort: 4222
+            - containerPort: 8222
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8222 }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: localai-nats-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+spec:
+  selector:
+    app: {{ .group }}_nats
+  ports:
+    - { name: tcp-nats, port: 4222, targetPort: 4222 }
+    - { name: http-monitor, port: 8222, targetPort: 8222 }
+
+# ------------------------------------------------------------------
+# FRONTEND (stateless: SmartRouter + API)
+# role: master e container "local-ai": stesse label del master P2P.
+# Lo YAML del modello (modelConfig) arriva via ConfigMap + initContainer,
+# come nel template P2P: è già in /models quando local-ai parte.
+# ------------------------------------------------------------------
+{{ if .modelConfig }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-ai-{{ .group }}-model-config
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+data:
+  {{ .modelConfig }}: |
+{{ index . "modelConfigContent" | indent 4 }}
+{{ end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localai-frontend-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    role: master
+spec:
+  replicas: {{ or (index . "frontendReplicas") 1 }}
+  selector:
+    matchLabels:
+      app: {{ .group }}_frontend
+  template:
+    metadata:
+      labels:
+        app: {{ .group }}_frontend
+        group: "{{ .group }}"
+        role: master
+      annotations:
+        # Postgres e NATS sono fuori dal mesh: il traffico di controllo
+        # esce diretto, senza passare dall'envoy del sidecar.
+        traffic.sidecar.istio.io/excludeOutboundPorts: "5432,4222"
+    spec:
+      schedulerName: {{ .schedulerName }}
+      initContainers:
+        # LocalAI non riprova la connessione al DB all'avvio: se Postgres
+        # non è pronto esce e va in CrashLoopBackOff. Aspettiamo PG e NATS.
+        - name: wait-control-plane
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z -w 2 localai-pg-{{ .group }} 5432; do echo "waiting postgres"; sleep 2; done
+              until nc -z -w 2 localai-nats-{{ .group }} 4222; do echo "waiting nats"; sleep 2; done
+              # pg_isready passa prima che l'init dello script entrypoint finisca
+              # (restart per TimescaleDB): margine di sicurezza.
+              sleep 10
+      {{ if .modelConfig }}
+        - name: preload-model-config
+          image: busybox:1.36
+          command: [sh, -c, "cp /model-config/{{ .modelConfig }} /models/{{ .modelConfig }}"]
+          volumeMounts:
+            - { name: model-config, mountPath: /model-config, readOnly: true }
+            - { name: models, mountPath: /models }
+      {{ end }}
+      containers:
+        - name: local-ai
+          image: localai/localai:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - { name: LOCALAI_DISTRIBUTED, value: "true" }
+            - { name: LOCALAI_NATS_URL, value: "nats://localai-nats-{{ .group }}:4222" }
+            - { name: LOCALAI_REGISTRATION_TOKEN, value: "{{ $token }}" }
+            - { name: LOCALAI_REGISTRATION_REQUIRE_AUTH, value: "true" }
+            - { name: LOCALAI_AUTO_APPROVE_NODES, value: "true" }
+            - { name: LOCALAI_AUTH, value: "true" }
+            - { name: LOCALAI_API_KEY, value: "{{ $apiKey }}" }     # chiave legacy (admin) usata dal gateway
+            - name: LOCALAI_AUTH_DATABASE_URL
+              value: "postgresql://localai:localai@localai-pg-{{ .group }}:5432/localai?sslmode=disable"
+            - name: LOCALAI_AGENT_POOL_DATABASE_URL
+              value: "postgresql://localai:localai@localai-pg-{{ .group }}:5432/localai_agents?sslmode=disable"
+            - { name: LOCALAI_EXPOSE_NODE_HEADER, value: "true" }
+            {{ with index . "modelScheduling" }}
+            - name: LOCALAI_MODEL_SCHEDULING
+              value: '{{ . }}'
+            {{ end }}
+            {{ if .modelConfig }}
+            # Come nel P2P: il frontend "installa" lo YAML (scarica i file
+            # che referenzia in /models). Il load vero avviene sul worker,
+            # al primo request, dopo lo staging HTTP dei pesi.
+            - name: PRELOAD_MODELS
+              value: '[{"url": "file:///models/{{ .modelConfig }}"}]'
+            {{ end }}
+            - { name: LOCALAI_VRAM_WARM_LIMIT, value: "0" }
+            - { name: MODELS_PATH, value: "/models" }
+            - { name: LOCALAI_LOG_LEVEL, value: "debug" }
+          {{ if .modelConfig }}
+          # Ready = il MODELLO risponde, non solo il processo HTTP.
+          # La prima esecuzione avvia il load (install backend + staging +
+          # LoadModel sul worker); finché non è pronto il frontend risponde
+          # 503 model_loading e il pod resta NotReady. Così il wait
+          # "Available" dell'executor copre anche il cold load e il
+          # load-gen parte a modello caldo.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  M=$(sed -n 's/^name:[[:space:]]*//p' /models/{{ .modelConfig }} | head -1 | tr -d "\"'")
+                  curl -sf -m 80 -o /dev/null \
+                    -H "Authorization: Bearer $LOCALAI_API_KEY" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+                    http://127.0.0.1:8080/v1/chat/completions
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 90
+            failureThreshold: 1000
+          {{ else }}
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 10
+          {{ end }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - { name: models, mountPath: /models }
+      volumes:
+        {{ if .modelConfig }}
+        - name: model-config
+          configMap:
+            name: local-ai-{{ .group }}-model-config
+        {{ end }}
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ or .models_pvc "localai-shared-models-pvc" }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: node-role
+                    operator: NotIn
+                    values: ["management"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: localai-frontend-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+spec:
+  # I worker devono potersi registrare anche mentre il frontend è NotReady
+  # (lo è finché il modello non è caricato, vedi readinessProbe).
+  publishNotReadyAddresses: true
+  selector:
+    app: {{ .group }}_frontend
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
+
+# ------------------------------------------------------------------
+# WORKER generici (il backend lo installa lo SmartRouter via NATS)
+# ------------------------------------------------------------------
+{{ range $i := until (or .numWorker 0) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localai-dworker-{{ $.group }}-{{ $i }}
+  namespace: {{ $.namespace }}
+  labels:
+    group: "{{ $.group }}"
+    role: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $.group }}_dworker_{{ $i }}
+  template:
+    metadata:
+      labels:
+        app: {{ $.group }}_dworker_{{ $i }}
+        group: "{{ $.group }}"
+        role: worker
+      annotations:
+        traffic.sidecar.istio.io/excludeOutboundPorts: "4222"
+    spec:
+      schedulerName: {{ $.schedulerName }}
+      {{ if $.workerNodeName }}
+      nodeSelector:
+        kubernetes.io/hostname: {{ $.workerNodeName }}
+      {{ end }}
+      containers:
+        - name: worker
+          image: localai/localai:latest
+          imagePullPolicy: IfNotPresent
+          args: ["worker"]
+          env:
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - { name: LOCALAI_SERVE_ADDR, value: "0.0.0.0:50051" }
+            - { name: LOCALAI_GRPC_MAX_PORT, value: "50100" }
+            - { name: LOCALAI_ADVERTISE_ADDR, value: "$(POD_IP):50051" }
+            - { name: LOCALAI_ADVERTISE_HTTP_ADDR, value: "$(POD_IP):50050" }
+            - { name: LOCALAI_REGISTER_TO, value: "http://localai-frontend-{{ $.group }}:8080" }
+            - { name: LOCALAI_NATS_URL, value: "nats://localai-nats-{{ $.group }}:4222" }
+            - { name: LOCALAI_REGISTRATION_TOKEN, value: "{{ $token }}" }
+            - { name: LOCALAI_REGISTRATION_REQUIRE_AUTH, value: "true" }
+            - { name: LOCALAI_NODE_NAME, value: "$(POD_NAME)" }
+            - { name: LOCALAI_NODE_LABELS, value: "k8s.node=$(NODE_NAME),group={{ $.group }}" }
+            - { name: LOCALAI_HEARTBEAT_INTERVAL, value: "10s" }
+            - { name: LOCALAI_BACKENDS_PATH, value: "/backends/amd64" }
+            - { name: MODELS_PATH, value: "/models" }
+            - { name: LOCALAI_LOG_LEVEL, value: "debug" }
+          ports:
+            - containerPort: 50050
+            - containerPort: 50051
+          readinessProbe:
+            httpGet: { path: /readyz, port: 50050 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 50050 }
+            periodSeconds: 20
+          {{ if $.workerMemoryLimitGi }}
+          resources:
+            limits:
+              memory: "{{ $.workerMemoryLimitGi }}Gi"
+          {{ end }}
+          volumeMounts:
+            - { name: local-backends, mountPath: /backends }
+            - { name: models, mountPath: /models }
+      volumes:
+        - name: local-backends
+          persistentVolumeClaim:
+            claimName: {{ or $.backend_pvc "localai-backend-all-pvc" }}
+        - name: models
+          emptyDir: {}          # i pesi arrivano via staging HTTP dal frontend
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: node-role
+                    operator: NotIn
+                    values: ["management"]
+{{ end }}
+
+# ------------------------------------------------------------------
+# GATEWAY per-nodo (nginx) -> frontend
+# Stesso contratto del template P2P: Service "node-proxy-<group>"
+# NodePort con externalTrafficPolicy: Local, letta da prepareLoadGen.
+# Inietta l'API key, così il load-gen non va modificato.
+# ------------------------------------------------------------------
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-proxy-conf-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      client_max_body_size 100m;
+      location / {
+        proxy_pass http://localai-frontend-{{ .group }}.{{ .namespace }}.svc.cluster.local:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Authorization "Bearer {{ $apiKey }}";
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+      }
+    }
+{{ range $node := .proxyNodes }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-proxy-{{ $.group }}-{{ $node }}
+  namespace: {{ $.namespace }}
+  labels:
+    group: "{{ $.group }}"
+    component: node-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway-{{ $.group }}-{{ $node }}
+  template:
+    metadata:
+      labels:
+        app: gateway-{{ $.group }}-{{ $node }}
+        group: "{{ $.group }}"
+        component: node-proxy
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: {{ $node }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - { name: conf, mountPath: /etc/nginx/conf.d }
+      volumes:
+        - name: conf
+          configMap:
+            name: node-proxy-conf-{{ $.group }}
+{{ end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-proxy-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    component: node-proxy
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    group: "{{ .group }}"
+    component: node-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      {{ if $nodePort }}nodePort: {{ $nodePort }}{{ end }}
