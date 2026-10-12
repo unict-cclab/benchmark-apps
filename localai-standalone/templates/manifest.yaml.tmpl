@@ -1,0 +1,432 @@
+{{- /*
+==================================================================
+benchmark-apps/localai-standalone/templates/manifest.yaml.tmpl
+
+LocalAI STANDALONE: un'application dell'executor = un modello.
+Per avere più modelli si mettono più application nell'experiment, tutte con
+questo template e ognuna con il suo `group` e il suo `modelConfig`.
+
+Per ogni application con modelConfig:
+  - ConfigMap  local-ai-<group>-model   lo YAML del modello (modelConfigContent)
+  - Deployment local-ai-<group>         LocalAI, un solo modello, repliche = minReplicas
+  - Service    local-ai-<group>         ClusterIP :8080, destinazione del router
+
+Per ogni application con proxyNodes (ingresso, come node-proxy nel P2P):
+  - ConfigMap  localai-router-conf          condivisa, identica in ogni application
+  - Deployment localai-router-<nodo>        nginx+njs, uno per nodo, condiviso
+  - Service    node-proxy-<group>           NodePort proxyNodePort, externalTrafficPolicy Local
+
+Il router legge "model" dalla richiesta e inoltra a local-ai-<id>, con
+id = nome del modello in minuscolo, caratteri non [a-z0-9] -> "-", max 40.
+QUINDI: group deve essere uguale all'id del `name:` dentro lo YAML del modello
+  name: qwen2.5-0.5b-instruct  ->  group: qwen2-5-0-5b-instruct
+(check-groups.py lo controlla prima del run).
+
+modelConfig: ""  -> l'application rende solo il router (utile come ingresso unico).
+
+Chiavi usate (tutte già passate da renderApplication):
+  group, namespace, schedulerName, proxyNodes, proxyNodePort, models_pvc,
+  backend_pvc, modelConfig, modelConfigContent, minReplicas, cpuRequest,
+  memoryRequest, workerMemoryLimitGi
+Chiavi opzionali lette con `index` (se mancano valgono i default):
+  localaiImage, threads, cpuLimit, externalBackends, parallel, backendsPath
+==================================================================
+*/ -}}
+{{- $image := or (index . "localaiImage") "quay.io/go-skynet/local-ai:v4.7.1" -}}
+{{- $replicas := or (index . "minReplicas") 1 -}}
+{{- $cpuReq := or (index . "cpuRequest") "2" -}}
+{{- $memReq := or (index . "memoryRequest") "2Gi" -}}
+{{- $cpuLim := or (index . "cpuLimit") "4" -}}
+{{- $threads := or (index . "threads") 4 -}}
+{{- /* Backend in una cartella per versione di LocalAI: un backend installato da un'altra versione
+       (es. dai worker distributed con localai:latest) non viene mai riusato per sbaglio.
+       Se cambi localaiImage, cambia anche questo percorso. */ -}}
+{{- $backendsPath := or (index . "backendsPath") "/backends/v4.7.1-amd64" -}}
+{{- if .modelConfig }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-ai-{{ .group }}-model
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    app: localai-standalone
+data:
+  {{ .modelConfig }}: |
+{{ indent 4 (index . "modelConfigContent") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: local-ai-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    app: localai-standalone
+    component: model
+    model: "{{ .group }}"
+  annotations:
+    localai.testbed/model-config: "{{ .modelConfig }}"
+spec:
+  replicas: {{ $replicas }}
+  selector:
+    matchLabels:
+      group: "{{ .group }}"
+      component: model
+  template:
+    metadata:
+      labels:
+        group: "{{ .group }}"
+        app: localai-standalone
+        component: model
+        model: "{{ .group }}"
+      annotations:
+        # Come nel template P2P: percorso dei backend letto via downward API (lo stesso meccanismo
+        # del plugin ArchitectureAware), ma con la versione di LocalAI nel nome della cartella.
+        # Al primo avvio LOCALAI_EXTERNAL_BACKENDS installa llama-cpp qui; poi viene riusato.
+        localai-backends-path: "{{ $backendsPath }}"
+    spec:
+      schedulerName: {{ .schedulerName }}
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # Mette lo YAML del modello nella cartella del modello prima che parta LocalAI.
+        - name: copy-model-config
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - cp /model-config/{{ .modelConfig }} /models/{{ .modelConfig }} && mkdir -p "$BACKENDS_PATH"
+          env:
+            - name: BACKENDS_PATH
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['localai-backends-path']
+          volumeMounts:
+            - { name: model-config, mountPath: /model-config }
+            - { name: models, mountPath: /models, subPath: "{{ .group }}" }
+            - { name: backends, mountPath: /backends }
+      containers:
+        - name: local-ai
+          image: {{ $image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            # Scarica i file elencati nello YAML (solo la prima volta: poi restano su NFS).
+            - name: PRELOAD_MODELS
+              value: '[{"url": "file:///models/{{ .modelConfig }}"}]'
+            - { name: LOCALAI_MODELS_PATH, value: /models }
+            - name: LOCALAI_BACKENDS_PATH
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['localai-backends-path']
+            # In standalone LocalAI non installa da solo il backend richiesto dallo YAML
+            # ("Backend not found: llama-cpp"): lo installiamo dalla gallery all'avvio.
+            # Se è già nel PVC condiviso viene saltato (come LOCALAI_EXTERNAL_BACKENDS del template P2P). Per altri backend: "llama-cpp,whisper".
+            - { name: LOCALAI_EXTERNAL_BACKENDS, value: "{{ or (index . "externalBackends") "llama-cpp" }}" }
+            - { name: LOCALAI_THREADS, value: "{{ $threads }}" }
+            - { name: LOCALAI_SINGLE_ACTIVE_BACKEND, value: "true" }
+            # Slot di generazione di llama.cpp: 1 = richieste in coda una alla volta (default su CPU).
+            # Con N > 1 la stessa replica genera N risposte insieme (contesto diviso tra gli slot).
+            - { name: LLAMACPP_PARALLEL, value: "{{ or (index . "parallel") 1 }}" }
+            - { name: DEBUG, value: "false" }
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: "{{ $cpuReq }}"
+              memory: "{{ $memReq }}"
+            limits:
+              cpu: "{{ $cpuLim }}"
+              memory: "{{ if index . "workerMemoryLimitGi" }}{{ index . "workerMemoryLimitGi" }}Gi{{ else }}4Gi{{ end }}"
+          # Pronto = modello scaricato E caricato in RAM: fa una richiesta da 1 token.
+          # Così il pod entra nel Service (e il kubectl wait dell'executor passa) solo da caldo.
+          # Fino a 30 minuti per il primo download.
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  m=$(curl -sf -m 5 http://127.0.0.1:8080/v1/models | grep -o '"id":"[^"]*"' | head -n1 | cut -d'"' -f4)
+                  [ -n "$m" ] || exit 1
+                  curl -sf -m 120 -H 'Content-Type: application/json' \
+                    -d "{\"model\":\"$m\",\"prompt\":\"ok\",\"max_tokens\":1}" \
+                    http://127.0.0.1:8080/v1/completions >/dev/null
+            periodSeconds: 15
+            timeoutSeconds: 130
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            # Cartella del solo modello di questa application: LocalAI vede un modello solo.
+            - { name: models, mountPath: /models, subPath: "{{ .group }}" }
+            # Backend condivisi da tutti i modelli (llama-cpp installato una volta sola).
+            - { name: backends, mountPath: /backends }
+      volumes:
+        - name: model-config
+          configMap:
+            name: local-ai-{{ .group }}-model
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ .models_pvc }}
+        - name: backends
+          persistentVolumeClaim:
+            claimName: {{ .backend_pvc }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: local-ai-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    app: localai-standalone
+    component: model
+spec:
+  type: ClusterIP
+  selector:
+    group: "{{ .group }}"
+    component: model
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: http
+{{- end }}
+{{- if .proxyNodes }}
+---
+# Condivisa: ogni application la scrive identica, kubectl apply è idempotente.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localai-router-conf
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-router
+data:
+  nginx.conf: |
+    load_module modules/ngx_http_js_module.so;
+
+    worker_processes auto;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 4096;
+    }
+
+    http {
+        js_path /etc/nginx/njs/;
+        js_import router from router.js;
+
+        # DNS del cluster: i nomi local-ai-<id> si risolvono a ogni richiesta (cache 10 s),
+        # quindi Service creati o cancellati dal testbed si vedono subito, senza reload.
+        # IP fisso di kube-dns in k3s (service_cidr 10.43.0.0/16 -> 10.43.0.10): con il nome
+        # nginx deve risolverlo all'avvio e, se il DNS non risponde in quel momento, esce.
+        resolver 10.43.0.10 valid=10s ipv6=off;
+        resolver_timeout 2s;
+
+        # Per gli esperimenti: modello, latenza totale e latenza dell'upstream per richiesta.
+        log_format route '$time_iso8601 $remote_addr "$request" model=$mid status=$status '
+                         'rt=$request_time urt=$upstream_response_time upstream=$upstream_addr';
+        access_log /dev/stdout route;
+
+        # Il body deve restare in memoria perché njs possa leggerlo: buffer = dimensione massima.
+        client_max_body_size    25m;
+        client_body_buffer_size 25m;
+
+        server {
+            listen 8080;
+
+            # Default per il log delle richieste che non arrivano a un modello.
+            set $mid "-";
+
+            location = /nginx-healthz {
+                access_log off;
+                return 200 "ok\n";
+            }
+
+            location / {
+                js_content router.route;
+            }
+
+            location ~ ^/_m/(?<mid>[a-z0-9-]+)(?<rest>/.*)$ {
+                internal;
+
+                # Nome del Service ricavato dal modello: proxy_pass con variabili = risoluzione a runtime.
+                set $svc local-ai-$mid.{{ $.namespace }}.svc.cluster.local;
+                proxy_pass http://$svc:8080$rest$is_args$args;
+
+                # Host = FQDN del Service: così Istio attribuisce la richiesta al Service giusto
+                # (sorgente router -> destinazione local-ai-<id>), non "unknown".
+                proxy_set_header Host $svc;
+                proxy_set_header X-Model-Id $mid;
+                # Nodo d'ingresso anche verso il backend, per correlare i log di LocalAI con la zona.
+                proxy_set_header X-LocalAI-Gateway $hostname;
+
+                # Per gli script di misura: da quale gateway (nodo d'ingresso) e verso quale modello.
+                add_header X-LocalAI-Gateway $hostname always;
+                add_header X-LocalAI-Model-Id $mid always;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+
+                # Streaming SSE (stream: true) senza buffering, e inferenza su CPU che può durare minuti.
+                proxy_buffering off;
+                proxy_read_timeout 900s;
+                proxy_send_timeout 900s;
+                proxy_connect_timeout 5s;
+
+                # Modello non deployato (DNS non risolve) o nessun pod pronto.
+                proxy_intercept_errors off;
+                error_page 502 503 504 = @unavailable;
+            }
+
+            location @unavailable {
+                default_type application/json;
+                return 503 '{"error":{"message":"modello non disponibile: deployment local-ai-$mid assente nel namespace {{ $.namespace }} o senza pod pronti","type":"model_unavailable","code":503}}\n';
+            }
+        }
+    }
+  router.js: |
+    // Router njs: legge il campo "model" della richiesta e la inoltra al Service
+    // local-ai-<id> del modello. <id> si calcola con la STESSA regola di render.sh,
+    // quindi un modello appena deployato è subito raggiungibile senza toccare nginx.
+
+    // Deve restare identica alla normalizzazione in render.sh.
+    function modelId(name) {
+        return String(name)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+/, '')
+            .replace(/-+$/, '')
+            .slice(0, 40)
+            .replace(/-+$/, '');
+    }
+
+    function jsonError(r, status, message, type) {
+        r.headersOut['Content-Type'] = 'application/json';
+        r.return(status, JSON.stringify({ error: { message: message, type: type, code: status } }) + '\n');
+    }
+
+    function extractModel(r) {
+        var body;
+        try {
+            body = r.requestText;          // body in memoria (vedi client_body_buffer_size)
+        } catch (e) {
+            return null;                   // body finito su file temporaneo: troppo grande
+        }
+        if (!body) {
+            return null;
+        }
+        var ct = r.headersIn['Content-Type'] || '';
+        if (ct.indexOf('multipart/form-data') !== -1) {
+            // es. /v1/audio/transcriptions: il modello è un campo del form
+            var m = body.match(/name="model"\r\n\r\n([^\r\n]+)/);
+            return m ? m[1] : null;
+        }
+        try {
+            var j = JSON.parse(body);
+            return (j && typeof j.model === 'string') ? j.model : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function route(r) {
+        // Header opzionale per forzare la destinazione (utile per test e per le GET senza body).
+        var model = r.headersIn['X-Model'] || extractModel(r);
+        if (!model) {
+            return jsonError(r, 400,
+                'impossibile determinare il modello: serve il campo "model" nel body JSON o l\'header X-Model',
+                'invalid_request_error');
+        }
+        var id = modelId(model);
+        if (!id) {
+            return jsonError(r, 400, 'nome modello non valido: ' + model, 'invalid_request_error');
+        }
+        var args = r.variables.args;
+        r.internalRedirect('/_m/' + id + r.uri + (args ? '?' + args : ''));
+    }
+
+    export default { route, modelId };
+{{- range $node := .proxyNodes }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localai-router-{{ $node }}
+  namespace: {{ $.namespace }}
+  labels:
+    app: localai-router
+    component: node-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: localai-router
+      router-node: "{{ $node }}"
+  template:
+    metadata:
+      labels:
+        app: localai-router
+        component: node-proxy
+        router-node: "{{ $node }}"
+    spec:
+      schedulerName: {{ $.schedulerName }}
+      nodeSelector:
+        kubernetes.io/hostname: {{ $node }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nginx
+          # Immagine ufficiale: include il modulo njs.
+          image: nginx:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /nginx-healthz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+          volumeMounts:
+            - { name: conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf }
+            - { name: conf, mountPath: /etc/nginx/njs/router.js, subPath: router.js }
+      volumes:
+        - name: conf
+          configMap:
+            name: localai-router-conf
+{{- end }}
+---
+# Ingresso di questa application per il load-gen: NodePort sui router condivisi.
+# externalTrafficPolicy Local: la richiesta resta sul nodo da cui entra.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-proxy-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    component: node-proxy
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app: localai-router
+    component: node-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      {{- if .proxyNodePort }}
+      nodePort: {{ .proxyNodePort }}
+      {{- end }}
+{{- end }}
