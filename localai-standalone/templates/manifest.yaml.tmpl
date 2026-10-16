@@ -1,32 +1,3 @@
-{{- /*
-==================================================================
-
-Per avere più modelli si mettono più application nell'experiment, tutte con
-questo template e ognuna con il suo `group` e il suo `modelConfig`.
-
-Per ogni application con modelConfig:
-  - ConfigMap  local-ai-<group>-model   lo YAML del modello (modelConfigContent)
-  - Deployment local-ai-<group>         LocalAI, un solo modello, repliche = minReplicas
-  - Service    local-ai-<group>         ClusterIP :8080,
-
-Per ogni application con proxyNodes :
-  - ConfigMap  localai-router-conf          condivisa, identica in ogni application
-  - Deployment localai-router-<nodo>        nginx+njs, uno per nodo, condiviso
-  - Service    node-proxy-<group>           NodePort proxyNodePort, externalTrafficPolicy Local
-
-Il router legge "model" dalla richiesta e inoltra a local-ai-<id>, con
-id = nome del modello corretto.
-QUINDI: group deve essere uguale all'id del `name:` dentro lo YAML del modello
-  name: qwen2.5-0.5b-instruct  ->  group: qwen2-5-0-5b-instruct.
-
-modelConfig: ""  -> l'application rende solo il router (utile come ingresso unico).
-
-Chiavi usate :
-  group, namespace, schedulerName, proxyNodes, proxyNodePort, models_pvc,
-  backend_pvc, modelConfig, modelConfigContent, minReplicas, cpuRequest,
-  memoryRequest, workerMemoryLimitGi
-==================================================================
-*/ -}}
 {{- $image := or (index . "localaiImage") "quay.io/go-skynet/local-ai:v4.7.1" -}}
 {{- $replicas := or (index . "minReplicas") 1 -}}
 {{- $cpuReq := or (index . "cpuRequest") "2" -}}
@@ -37,6 +8,11 @@ Chiavi usate :
        (es. dai worker distributed con localai:latest) non viene mai riusato per sbaglio.
        Se cambi localaiImage, cambia anche questo percorso. */ -}}
 {{- $backendsPath := or (index . "backendsPath") "/backends/v4.7.1-amd64" -}}
+{{- $routing := or (index . "routing") "node" -}}
+{{- $lbPolicy := or (index . "lbPolicy") "" -}}
+{{- $localityLb := or (index . "localityLb") "" -}}
+{{- $agentImage := or (index . "agentImage") "python:3.12-alpine" -}}
+{{- $routingOpt := or (index . "routingOpt") "1" -}}
 {{- if .modelConfig }}
 ---
 apiVersion: v1
@@ -77,13 +53,7 @@ spec:
         component: model
         model: "{{ .group }}"
       annotations:
-        # percorso dei backend letto via downward API
-        # Al primo avvio LOCALAI_EXTERNAL_BACKENDS installa llama-cpp qui; poi viene riusato.
         localai-backends-path: "{{ $backendsPath }}"
-        # Coda del modello vista da Envoy: richieste aperte verso questo pod (in generazione + in coda).
-        # Istio di default non crea questa statistica; qui la attiviamo solo per il listener in ingresso.
-        # Lettura: istio-proxy :15000/stats -> cluster.inbound|8080||.upstream_rq_active
-        # (e su Prometheus come envoy_cluster_upstream_rq_active{cluster_name="inbound|8080||"}).
         proxy.istio.io/config: |
           proxyStatsMatcher:
             inclusionRegexps:
@@ -93,7 +63,6 @@ spec:
       schedulerName: {{ .schedulerName }}
       terminationGracePeriodSeconds: 30
       initContainers:
-        # Mette lo YAML del modello nella cartella del modello prima che parta LocalAI.
         - name: copy-model-config
           image: busybox:1.36
           command:
@@ -114,7 +83,6 @@ spec:
           image: {{ $image }}
           imagePullPolicy: IfNotPresent
           env:
-            # Scarica i file elencati nello YAML (solo la prima volta: poi restano su NFS).
             - name: PRELOAD_MODELS
               value: '[{"url": "file:///models/{{ .modelConfig }}"}]'
             - { name: LOCALAI_MODELS_PATH, value: /models }
@@ -122,8 +90,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.annotations['localai-backends-path']
-            # ("Backend not found: llama-cpp"): lo installiamo dalla gallery all'avvio.
-            # Se è già nel PVC condiviso viene saltato 
+            - { name: LOCALAI_EXTERNAL_BACKENDS, value: "{{ or (index . "externalBackends") "llama-cpp" }}" }
             - { name: LOCALAI_THREADS, value: "{{ $threads }}" }
             - { name: LOCALAI_SINGLE_ACTIVE_BACKEND, value: "true" }
             - { name: LLAMACPP_PARALLEL, value: "{{ or (index . "parallel") 1 }}" }
@@ -138,9 +105,6 @@ spec:
             limits:
               cpu: "{{ $cpuLim }}"
               memory: "{{ if index . "workerMemoryLimitGi" }}{{ index . "workerMemoryLimitGi" }}Gi{{ else }}4Gi{{ end }}"
-          # Pronto = modello scaricato E caricato in RAM: fa una richiesta da 1 token.
-          # Così il pod entra nel Service (e il kubectl wait dell'executor passa) solo da caldo.
-          # Fino a 30 minuti per il primo download.
           startupProbe:
             exec:
               command:
@@ -164,9 +128,7 @@ spec:
             periodSeconds: 20
             failureThreshold: 3
           volumeMounts:
-            # Cartella del solo modello di questa application: LocalAI vede un modello solo.
             - { name: models, mountPath: /models, subPath: "{{ .group }}" }
-            # Backend condivisi da tutti i modelli (llama-cpp installato una volta sola).
             - { name: backends, mountPath: /backends }
       volumes:
         - name: model-config
@@ -198,8 +160,35 @@ spec:
       protocol: TCP
       port: 8080
       targetPort: http
+{{- if or $lbPolicy $localityLb }}
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: local-ai-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    app: localai-standalone
+spec:
+  host: local-ai-{{ .group }}.{{ .namespace }}.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      simple: {{ or $lbPolicy "LEAST_REQUEST" }}
+      {{- if $localityLb }}
+      localityLbSetting:
+        enabled: true
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      {{- end }}
+{{- end }}
 {{- end }}
 {{- if .proxyNodes }}
+{{- $tableUrl := "" -}}
+{{- if eq $routing "central" }}{{ $tableUrl = printf "http://localai-routing-collector.%s.svc.cluster.local:9100/table" .namespace }}{{ end -}}
+{{- if eq $routing "node" }}{{ $tableUrl = "http://127.0.0.1:9100/table" }}{{ end }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -216,6 +205,9 @@ data:
     error_log /dev/stderr warn;
     pid /tmp/nginx.pid;
 
+    env ROUTING_TABLE_URL;
+    env NODE_NAME;
+
     events {
         worker_connections 4096;
     }
@@ -224,33 +216,28 @@ data:
         js_path /etc/nginx/njs/;
         js_import router from router.js;
 
-        # Percorso veloce: id del modello dall'header X-Model (nome o id, normalizzato da njs).
-        # js_set guarda solo gli header, quindi il body NON viene letto: passa in streaming.
         js_set $hdr_mid router.idFromHeader;
 
-        # DNS del cluster: i nomi local-ai-<id> si risolvono a ogni richiesta (cache 10 s),
-        # quindi Service creati o cancellati dal testbed si vedono subito, senza reload.
-        # IP fisso di kube-dns in k3s (service_cidr 10.43.0.0/16 -> 10.43.0.10): con il nome
-        # nginx deve risolverlo all'avvio e, se il DNS non risponde in quel momento, esce.
+        js_shared_dict_zone zone=rt:4m timeout=10s evict;
+        js_shared_dict_zone zone=rt_sent:1m type=number timeout=10s evict;
+        js_shared_dict_zone zone=rt_stats:64k type=number;
+        js_set $rt_upstream router.pickUpstream;
+        js_var $rt_info "-";
+
         resolver 10.43.0.10 valid=10s ipv6=off;
         resolver_timeout 2s;
 
-        # Per gli esperimenti: modello, latenza totale e latenza dell'upstream per richiesta.
-        # via=header -> instradata dall'header X-Model (streaming); via=body -> letta dal body con njs.
         log_format route '$time_iso8601 $remote_addr "$request" model=$mid via=$via status=$status '
-                         'rt=$request_time urt=$upstream_response_time upstream=$upstream_addr';
+                         'rt=$request_time urt=$upstream_response_time upstream=$upstream_addr route="$rt_info"';
         map $hdr_mid $via { "" body; default header; }
         access_log /dev/stdout route;
 
-        # Percorso dal body: deve restare in memoria perché njs possa leggerlo (buffer = dimensione massima).
-        # Il limite vale anche per il percorso dall'header.
         client_max_body_size    25m;
         client_body_buffer_size 25m;
 
         server {
             listen 8080;
 
-            # Default per il log delle richieste che non arrivano a un modello.
             set $mid "-";
 
             location = /nginx-healthz {
@@ -258,9 +245,15 @@ data:
                 return 200 "ok\n";
             }
 
-            # Versione ibrida:
-            #  - con header X-Model -> rewrite diretto verso /_m/<id>/..., nginx non legge il body;
-            #  - senza header       -> njs legge "model" dal body (client OpenAI standard).
+            location @periodics {
+                js_periodic router.refresh interval=250ms;
+            }
+
+            location = /routing-table {
+                access_log off;
+                js_content router.dumpTable;
+            }
+
             location / {
                 if ($hdr_mid) {
                     rewrite ^ /_m/$hdr_mid$uri last;
@@ -271,33 +264,25 @@ data:
             location ~ ^/_m/(?<mid>[a-z0-9-]+)(?<rest>/.*)$ {
                 internal;
 
-                # Nome del Service ricavato dal modello: proxy_pass con variabili = risoluzione a runtime.
                 set $svc local-ai-$mid.{{ $.namespace }}.svc.cluster.local;
-                proxy_pass http://$svc:8080$rest$is_args$args;
+                proxy_pass http://$rt_upstream$rest$is_args$args;
 
-                # Host = FQDN del Service: così Istio attribuisce la richiesta al Service giusto
-                # (sorgente router -> destinazione local-ai-<id>), non "unknown".
                 proxy_set_header Host $svc;
                 proxy_set_header X-Model-Id $mid;
-                # Nodo d'ingresso anche verso il backend, per correlare i log di LocalAI con la zona.
                 proxy_set_header X-LocalAI-Gateway $hostname;
 
-                # Per gli script di misura: da quale gateway (nodo d'ingresso) e verso quale modello.
                 add_header X-LocalAI-Gateway $hostname always;
                 add_header X-LocalAI-Model-Id $mid always;
+                add_header X-LocalAI-Route $rt_info always;
                 proxy_http_version 1.1;
                 proxy_set_header Connection "";
 
-                # Streaming SSE (stream: true) senza buffering, e inferenza su CPU che può durare minuti.
                 proxy_buffering off;
-                # Percorso dall'header: il body va al backend mentre arriva. Percorso dal body:
-                # njs l'ha già letto e nginx manda quello in memoria.
                 proxy_request_buffering off;
                 proxy_read_timeout 900s;
                 proxy_send_timeout 900s;
                 proxy_connect_timeout 5s;
 
-                # Modello non deployato (DNS non risolve) o nessun pod pronto.
                 proxy_intercept_errors off;
                 error_page 502 503 504 = @unavailable;
             }
@@ -307,13 +292,19 @@ data:
                 return 503 '{"error":{"message":"modello non disponibile: deployment local-ai-$mid assente nel namespace {{ $.namespace }} o senza pod pronti","type":"model_unavailable","code":503}}\n';
             }
         }
+
+        server {
+            listen 9180;
+            access_log off;
+            location = /routing-update {
+                js_content router.update;
+            }
+            location / {
+                return 404;
+            }
+        }
     }
   router.js: |
-    // Router njs: legge il campo "model" della richiesta e la inoltra al Service
-    // local-ai-<id> del modello. <id> si calcola con la STESSA regola di render.sh,
-    // quindi un modello appena deployato è subito raggiungibile senza toccare nginx.
-
-    // Deve restare identica alla normalizzazione in render.sh.
     function modelId(name) {
         return String(name)
             .toLowerCase()
@@ -332,16 +323,15 @@ data:
     function extractModel(r) {
         var body;
         try {
-            body = r.requestText;          // body in memoria (vedi client_body_buffer_size)
+            body = r.requestText;
         } catch (e) {
-            return null;                   // body finito su file temporaneo: troppo grande
+            return null;
         }
         if (!body) {
             return null;
         }
         var ct = r.headersIn['Content-Type'] || '';
         if (ct.indexOf('multipart/form-data') !== -1) {
-            // es. /v1/audio/transcriptions: il modello è un campo del form
             var m = body.match(/name="model"\r\n\r\n([^\r\n]+)/);
             return m ? m[1] : null;
         }
@@ -354,7 +344,6 @@ data:
     }
 
     function route(r) {
-        // Header opzionale per forzare la destinazione (utile per test e per le GET senza body).
         var model = r.headersIn['X-Model'] || extractModel(r);
         if (!model) {
             return jsonError(r, 400,
@@ -369,14 +358,1047 @@ data:
         r.internalRedirect('/_m/' + id + r.uri + (args ? '?' + args : ''));
     }
 
-    // Per js_set: id dal solo header X-Model (nome del modello o id già pulito), "" se manca.
-    // Non tocca il body, quindi non ne forza la lettura.
     function idFromHeader(r) {
         var h = r.headersIn['X-Model'];
         return h ? modelId(h) : '';
     }
 
-    export default { route, modelId, idFromHeader };
+
+    var DEFAULT_POLICY = {
+        weights: { queue: 1, network: 1 },
+        serviceTimeS: { 'default': 1.0 },      // tempo di una risposta con 1 slot, per modello
+        networkRttS: { sameNode: 0, sameZone: 0.001, crossZone: 0.07 },
+        networkSource: 'measured',             // measured (RTT tra agenti, modalità node) | static
+        networkRttMultiplier: 2,               // connessione + richiesta
+        staleS: 3,                             // dato più vecchio di così = pod escluso
+        hysteresisS: 0.2                       // differenze di costo sotto questa soglia: vince la rete
+    };
+
+    function policyOf(meta) {
+        var p = (meta && meta.policy) || {};
+        var out = {};
+        for (var k in DEFAULT_POLICY) {
+            out[k] = (p[k] !== undefined) ? p[k] : DEFAULT_POLICY[k];
+        }
+        return out;
+    }
+
+    var FILTERS = [
+        function ready(p) { return p.ready !== false; },
+        function noError(p) { return !(p.signals && p.signals.error); }
+    ];
+
+    var SCORERS = {
+        queue: function (p, c) {
+            var slots = p.slots || 1;
+            var busy = ((p.signals && p.signals.active) || 0) + c.sentSince(p);
+            var waiting = Math.max(0, busy - slots + 1);
+            return waiting * c.serviceTime(p) / slots;
+        },
+        network: function (p, c) {
+            return c.rtt(p) * c.policy.networkRttMultiplier;
+        }
+
+    };
+
+    function makeContext(meta, model, selfNode, now, sentLookup) {
+        var policy = policyOf(meta);
+        var nodes = (meta && meta.nodes) || {};
+        var rtts = (meta && meta.rtt) || {};
+        var selfZone = nodes[selfNode] || '';
+        return {
+            policy: policy,
+            now: now,
+            confirmed: (meta && meta.confirmed) || 0,
+            selfNode: selfNode,
+            serviceTime: function (p) {
+                var st = policy.serviceTimeS || {};
+                return st[p.model] || st['default'] || 1.0;
+            },
+            rtt: function (p) {
+                var n = policy.networkRttS;
+                if (p.node === selfNode) {
+                    return n.sameNode || 0;
+                }
+                if (policy.networkSource === 'measured' && rtts[p.node] !== undefined) {
+                    return rtts[p.node];
+                }
+                var z = p.zone || nodes[p.node] || '';
+                return (selfZone && z === selfZone) ? n.sameZone : n.crossZone;
+            },
+            sentSince: function (p) {
+                return sentLookup(p.addr, p.ts, now);
+            }
+        };
+    }
+
+    function choose(pods, c, rnd) {
+        var cands = [];
+        for (var i = 0; i < pods.length; i++) {
+            var p = pods[i];
+            var ok = true;
+            for (var f = 0; f < FILTERS.length && ok; f++) {
+                ok = FILTERS[f](p, c);
+            }
+            if (!ok) {
+                continue;
+            }
+            var parts = {};
+            var total = 0;
+            for (var name in SCORERS) {
+                var w = (c.policy.weights || {})[name];
+                if (!w) {
+                    continue;
+                }
+                var v = SCORERS[name](p, c);
+                parts[name] = v;
+                total += w * v;
+            }
+            cands.push({ pod: p, cost: total, parts: parts });
+        }
+        if (!cands.length) {
+            return null;
+        }
+        var best = Infinity;
+        for (var j = 0; j < cands.length; j++) {
+            best = Math.min(best, cands[j].cost);
+        }
+        var near = cands.filter(function (x) { return x.cost <= best + c.policy.hysteresisS; });
+        var minNet = Infinity;
+        near.forEach(function (x) { minNet = Math.min(minNet, x.parts.network || 0); });
+        var finalists = near.filter(function (x) { return (x.parts.network || 0) <= minNet + 1e-9; });
+        var pick = finalists[Math.floor((rnd || Math.random)() * finalists.length)];
+        return { pick: pick, candidates: cands };
+    }
+
+    // --------------------------------------------- integrazione con nginx (memoria condivisa, aggiornamento)
+
+    var BUCKET_MS = 100;
+
+    function sentLookupShared(addr, ts, now) {
+        var d = ngx.shared.rt_sent;
+        var from = Math.floor(ts * 1000 / BUCKET_MS);
+        var to = Math.floor(now * 1000 / BUCKET_MS);
+        if (to - from > 50) {
+            from = to - 50;
+        }
+        var n = 0;
+        for (var b = from; b <= to; b++) {
+            n += d.get(addr + '|' + b) || 0;
+        }
+        return n;
+    }
+
+    function markSent(addr, now) {
+        ngx.shared.rt_sent.incr(addr + '|' + Math.floor(now * 1000 / BUCKET_MS), 1, 0);
+    }
+
+    function pickUpstream(r) {
+        var mid = r.variables.mid;
+        var fallback = r.variables.svc + ':8080';
+        var raw = ngx.shared.rt.get('m:' + mid);
+        var metaRaw = ngx.shared.rt.get('meta');
+        if (!raw || !metaRaw) {
+            r.variables.rt_info = 'service';
+            return fallback;
+        }
+        var now = Date.now() / 1000;
+        var meta = JSON.parse(metaRaw);
+        meta.confirmed = parseFloat(ngx.shared.rt.get('confirmed') || '0');
+        var c = makeContext(meta, mid, process.env.NODE_NAME || '', now, sentLookupShared);
+        var res = choose(JSON.parse(raw), c);
+        if (!res) {
+            r.variables.rt_info = 'service(no-candidate)';
+            return fallback;
+        }
+        markSent(res.pick.pod.addr, now);
+        var parts = res.pick.parts;
+        r.variables.rt_info = res.pick.pod.pod + ' cost=' + res.pick.cost.toFixed(3) +
+            Object.keys(parts).map(function (k) { return ' ' + k + '=' + parts[k].toFixed(3); }).join('') +
+            ' cands=' + res.candidates.length +
+            ' age=' + (now - Math.max(res.pick.pod.ts, meta.confirmed)).toFixed(3);   // età della conferma del dato
+        return res.pick.pod.addr;
+    }
+
+    function ekey(e) {
+        return JSON.stringify([e.ready, e.slots, e.signals]);
+    }
+
+    function touch(d, k) {                      // rinnova la scadenza di una chiave non cambiata
+        var v = d.get(k);
+        if (v !== undefined) {
+            d.set(k, v);
+        }
+    }
+
+
+    function applyTable(t) {
+        var d = ngx.shared.rt;
+        var st = ngx.shared.rt_stats;
+        var now = Date.now() / 1000;
+        var keys = d.keys();
+        if (t.unchanged) {
+            keys.forEach(function (k) { if (k === 'meta' || k.indexOf('m:') === 0) { touch(d, k); } });
+        } else {
+            if (t.policy !== undefined) {
+                d.set('meta', JSON.stringify({ policy: t.policy, nodes: t.nodes, rtt: t.rtt, agent: t.agent,
+                                               generated: t.generated }));
+            } else {
+                touch(d, 'meta');
+            }
+            var models = t.models || {};
+            for (var m in models) {
+                var oldRaw = d.get('m:' + m);
+                var old = {};
+                if (oldRaw) {
+                    JSON.parse(oldRaw).forEach(function (e) { old[e.pod] = ekey(e); });
+                }
+                models[m].forEach(function (e) {
+                    if (oldRaw && old[e.pod] !== ekey(e)) {
+                        st.incr('chg_n', 1, 0);
+                        st.incr('chg_ms', Math.max(0, Math.round((now - (e.mts || e.ts)) * 1000)), 0);
+                    }
+                });
+                d.set('m:' + m, JSON.stringify(models[m]));
+            }
+            var present = t.models_present || Object.keys(models);
+            keys.forEach(function (k) {
+                if (k.indexOf('m:') !== 0) {
+                    return;
+                }
+                if (present.indexOf(k.slice(2)) < 0) {
+                    d.delete(k);                 // modello sparito
+                } else if (!models[k.slice(2)]) {
+                    touch(d, k);                 // modello non cambiato
+                }
+            });
+        }
+        d.set('confirmed', String(t.generated));
+        d.set('version', String(t.version));
+    }
+
+    function update(r) {
+        try {
+            applyTable(JSON.parse(r.requestText));
+            ngx.shared.rt.set('pushed_at', String(Date.now()));
+            ngx.shared.rt_stats.incr('pushes', 1, 0);
+            r.return(200, '{"ok":true}\n');
+        } catch (e) {
+            r.return(400, '{"error":"' + String(e).replace(/"/g, "'") + '"}\n');
+        }
+    }
+
+    async function refresh(s) {
+        var url = process.env.ROUTING_TABLE_URL;
+        if (!url) {
+            return;                          // modalità istio: nessuna tabella, decide Envoy
+        }
+        var d = ngx.shared.rt;
+        var pushed = parseFloat(d.get('pushed_at') || '0');
+        if (pushed && Date.now() - pushed < 3000) {
+            return;
+        }
+        try {
+            var ver = d.get('version');
+            var u = url + (ver ? (url.indexOf('?') < 0 ? '?' : '&') + 'since=' + ver : '');
+            var res = await ngx.fetch(u, { max_response_body_size: 4194304 });
+            var t = await res.json();          // njs: niente await dentro gli argomenti di una chiamata
+            applyTable(t);
+            ngx.shared.rt_stats.incr('fetches', 1, 0);
+        } catch (e) {
+            ngx.shared.rt_stats.incr('fetch_errors', 1, 0);
+            ngx.log(ngx.WARN, 'routing: tabella non disponibile da ' + url + ': ' + e);
+        }
+    }
+
+    function dumpTable(r) {
+        var d = ngx.shared.rt;
+        var out = { node: process.env.NODE_NAME || '', meta: null, models: {}, stats: {} };
+        var st = ngx.shared.rt_stats;
+        st.keys().forEach(function (k) { out.stats[k] = st.get(k); });
+        d.keys().forEach(function (k) {
+            if (k === 'pushed_at') {
+                return;
+            }
+            if (k === 'confirmed' || k === 'version') {
+                out[k] = parseFloat(d.get(k));
+                return;
+            }
+            var v = JSON.parse(d.get(k));
+            if (k === 'meta') {
+                out.meta = v;
+            } else if (k.indexOf('m:') === 0) {
+                out.models[k.slice(2)] = v;
+            }
+        });
+        r.headersOut['Content-Type'] = 'application/json';
+        r.return(200, JSON.stringify(out) + '\n');
+    }
+
+    export default { route, modelId, idFromHeader, pickUpstream, refresh, update, dumpTable,
+                     choose, makeContext, SCORERS, FILTERS, DEFAULT_POLICY };
+  routing-agent.py: |
+    #!/usr/bin/env python3
+
+    import argparse
+    import concurrent.futures
+    import json
+    import os
+    import re
+    import ssl
+    import threading
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+    ACTIVE_RE = re.compile(r'^envoy_cluster_upstream_rq_active\{[^}]*cluster_name="inbound\|8080\|\|[^"]*"[^}]*\}\s+([0-9.eE+-]+)', re.M)
+
+
+    def log(*a):
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+
+    def collect_envoy_queue(pod, http_get):
+        """Richieste aperte verso LocalAI viste dall'Envoy del pod. None se la statistica non esiste ancora."""
+        body = http_get(pod["metrics"])
+        m = ACTIVE_RE.search(body)
+        return {"active": int(float(m.group(1))) if m else 0}
+
+
+    COLLECTORS = {
+        "envoy_queue": collect_envoy_queue,
+    }
+
+
+
+    class K8s:
+        """Client minimo dell'API di Kubernetes da dentro il cluster (token del ServiceAccount)."""
+
+        def __init__(self):
+            host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+            port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+            self.base = f"https://{host}:{port}"
+            self.ctx = ssl.create_default_context(cafile=f"{SA_DIR}/ca.crt")
+
+        def get(self, path, **params):
+            token = open(f"{SA_DIR}/token").read().strip()   
+            url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
+            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+            with urllib.request.urlopen(req, timeout=5, context=self.ctx) as r:
+                return json.load(r)
+
+
+    class K8sDiscovery:
+        def __init__(self, a):
+            self.a = a
+            self.k8s = K8s()
+            self.zones, self.zones_at = {}, 0
+
+        def node_zones(self):
+            if time.time() - self.zones_at > 60:
+                nodes = self.k8s.get("/api/v1/nodes")["items"]
+                self.zones = {n["metadata"]["name"]: n["metadata"].get("labels", {}).get(self.a.zone_label, "")
+                              for n in nodes}
+                self.zones_at = time.time()
+            return self.zones
+
+        def pods(self):
+            """Pod dei modelli da leggere: in modalità node solo quelli del proprio nodo."""
+            params = {"labelSelector": self.a.model_selector}
+            if self.a.mode == "node":
+                params["fieldSelector"] = f"spec.nodeName={self.a.node}"
+            items = self.k8s.get(f"/api/v1/namespaces/{self.a.namespace}/pods", **params)["items"]
+            zones = self.node_zones()
+            out = []
+            for p in items:
+                st, spec, meta = p.get("status", {}), p["spec"], p["metadata"]
+                ip = st.get("podIP")
+                if not ip or st.get("phase") != "Running" or meta.get("deletionTimestamp"):
+                    continue
+                ready = any(c["type"] == "Ready" and c["status"] == "True" for c in st.get("conditions", []))
+                slots = 1
+                for c in spec.get("containers", []):
+                    for e in c.get("env", []) or []:
+                        if e.get("name") == "LLAMACPP_PARALLEL" and str(e.get("value", "")).isdigit():
+                            slots = int(e["value"])
+                node = spec.get("nodeName", "")
+                out.append({
+                    "pod": meta["name"], "addr": f"{ip}:{self.a.app_port}",
+                    "metrics": f"http://{ip}:{self.a.metrics_port}/stats/prometheus?filter=upstream_rq_active",
+                    "node": node, "zone": zones.get(node, ""),
+                    "model": meta.get("labels", {}).get("group", ""), "ready": ready, "slots": slots,
+                })
+            return out
+
+        def peers(self):
+            """Agenti degli altri nodi (modalità node): un pod del router per nodo, il più recente,
+            esclusi quelli in chiusura (durante un rollout convivono il vecchio e il nuovo)."""
+            items = self.k8s.get(f"/api/v1/namespaces/{self.a.namespace}/pods",
+                                 labelSelector=self.a.peer_selector)["items"]
+            best = {}
+            for p in items:
+                st, meta = p.get("status", {}), p["metadata"]
+                ip, node = st.get("podIP"), p["spec"].get("nodeName", "")
+                if not ip or st.get("phase") != "Running" or meta.get("deletionTimestamp") or node == self.a.node:
+                    continue
+                if node not in best or meta["creationTimestamp"] > best[node][0]:
+                    best[node] = (meta["creationTimestamp"], ip)
+            return [{"node": n, "url": f"http://{ip}:{self.a.port}"} for n, (_, ip) in best.items()]
+
+
+    def newest_per_node(items, exclude_node=None):
+        """Pod in esecuzione, non in chiusura, il più recente per nodo -> {nodo: ip}."""
+        best = {}
+        for p in items:
+            st, meta = p.get("status", {}), p["metadata"]
+            ip, node = st.get("podIP"), p["spec"].get("nodeName", "")
+            if not ip or st.get("phase") != "Running" or meta.get("deletionTimestamp") or node == exclude_node:
+                continue
+            if node not in best or meta["creationTimestamp"] > best[node][0]:
+                best[node] = (meta["creationTimestamp"], ip)
+        return {n: ip for n, (_, ip) in best.items()}
+
+
+    def _k8s_routers(self):
+        items = self.k8s.get(f"/api/v1/namespaces/{self.a.namespace}/pods", labelSelector=self.a.peer_selector)["items"]
+        return [{"node": n, "url": f"http://{ip}:{self.a.router_port}"} for n, ip in newest_per_node(items).items()]
+
+
+    K8sDiscovery.routers = _k8s_routers
+
+
+    class StaticDiscovery:
+
+        def __init__(self, a):
+            self.a = a
+
+        def _load(self):
+            with open(self.a.static_file) as f:
+                return json.load(f)
+
+        def node_zones(self):
+            return self._load().get("nodes", {})
+
+        def pods(self):
+            d = self._load()
+            pods = [dict(p, zone=p.get("zone") or d.get("nodes", {}).get(p["node"], "")) for p in d["pods"]]
+            if self.a.mode == "node":
+                pods = [p for p in pods if p["node"] == self.a.node]
+            return pods
+
+        def peers(self):
+            return [p for p in self._load().get("peers", []) if p["node"] != self.a.node]
+
+        def routers(self):
+            return self._load().get("routers", [])
+
+
+
+    HDR = 250   
+
+
+    def ekey(e):
+        return json.dumps([e.get("ready"), e.get("slots"), e.get("signals")], sort_keys=True)
+
+
+    class State:
+        def __init__(self, a, disc):
+            self.a = a
+            self.disc = disc
+            self.lock = threading.Lock()
+            self.cond = threading.Condition(self.lock)
+            self.routers = []      
+            self.local = {}        
+            self.remote = {}       
+            self.rtt = {}          
+            self.nodes = {}        
+            self.peers = []
+            self.pod_list = []
+            self.policy = {}
+            self.policy_mtime = 0
+            self.need_pull = set() 
+            self.changed_ev = threading.Event()   
+            self.version = int(time.time() * 1000)
+            self.model_ver = {}
+            self.meta_key, self.meta_ver = "", self.version
+            self.models_present = set()
+            self.counters = {"polls": 0, "poll_errors": 0, "poll_bytes": 0, "polls_xzone": 0, "poll_bytes_xzone": 0,
+                             "ex_out": 0, "bytes_out": 0, "ex_out_xzone": 0, "bytes_out_xzone": 0,
+                             "push_msgs": 0, "pings": 0, "pulls": 0, "push_errors": 0,
+                             "recv_msgs": 0, "recv_bytes": 0, "table_reads": 0, "table_bytes": 0,
+                             "table_unchanged": 0, "chg_delay_sum": 0.0, "chg_delay_n": 0}
+            self.started = time.time()
+
+        def self_zone(self):
+            return self.nodes.get(self.a.node, "") if self.a.node else ""
+
+        def count(self, k, n=1):
+            with self.lock:
+                self.counters[k] += n
+
+        def count_exchange(self, peer_node, nbytes, kind):
+            with self.lock:
+                self.counters["ex_out"] += 1
+                self.counters["bytes_out"] += nbytes
+                self.counters[kind] += 1
+                if self.nodes.get(peer_node, "") != self.self_zone():
+                    self.counters["ex_out_xzone"] += 1
+                    self.counters["bytes_out_xzone"] += nbytes
+
+        def bump(self, models):
+            self.version += 1
+            for m in models:
+                self.model_ver[m] = self.version
+            self.cond.notify_all()         
+
+        def load_policy(self):
+            try:
+                mt = os.path.getmtime(self.a.policy_file)
+                if mt != self.policy_mtime:
+                    with open(self.a.policy_file) as f:
+                        self.policy = json.load(f)
+                    self.policy_mtime = mt
+                    log("policy caricata", self.a.policy_file)
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError) as e:
+                log("policy non valida:", e)
+
+        def table(self, since=None):
+            stale = float(self.policy.get("staleS", 5))
+            with self.lock:
+                now = time.time()
+                for src, r in list(self.remote.items()):
+                    if now - r["received"] > stale * 2:     
+                        self.bump({e["model"] for e in r["entries"].values()})
+                        del self.remote[src]
+                meta = {"policy": self.policy, "nodes": self.nodes,
+                        "rtt": {k: round(v, 4) for k, v in self.rtt.items()}}
+                mk = json.dumps(meta, sort_keys=True)
+                if mk != self.meta_key:
+                    self.meta_key, self.version = mk, self.version + 1
+                    self.meta_ver = self.version
+                entries = {k: dict(e, mts=e["ts"]) for k, e in self.local.items()}
+                for r in self.remote.values():
+                    for k, e in r["entries"].items():
+                        entries[k] = dict(e, ts=max(e["ts"], r.get("last_sent", 0)), mts=e["ts"])
+                models = {}
+                for e in entries.values():
+                    models.setdefault(e["model"], []).append(e)
+                for m in set(models) - self.models_present:
+                    self.model_ver.setdefault(m, self.version)
+                self.models_present = set(models)
+                self.counters["table_reads"] += 1
+                agent = {"mode": self.a.mode, "opt": self.a.opt, "node": self.a.node, "zone": self.self_zone(),
+                         "counters": dict(self.counters), "cpu_s": round(time.process_time(), 3),
+                         "uptime_s": round(now - self.started, 1)}
+                out = {"version": self.version, "generated": now}
+                if self.a.opt and since is not None and since >= self.version:
+                    self.counters["table_unchanged"] += 1
+                    return dict(out, unchanged=True)
+                if self.a.opt and since is not None and since > 0:
+                    out.update(partial=True, models_present=sorted(models),
+                               models={m: v for m, v in models.items() if self.model_ver.get(m, 0) > since})
+                    if self.meta_ver > since:
+                        out.update(meta)
+                    return out
+                out.update(meta, agent=agent, models=models)
+                return out
+
+
+    def http_get_factory(state, pod=None):
+        def http_get(url):
+            with urllib.request.urlopen(url, timeout=state.a.poll_timeout) as r:
+                body = r.read()
+            xz = pod is not None and pod.get("zone", "") != state.self_zone()
+            with state.lock:
+                state.counters["poll_bytes"] += len(body)
+                if xz:
+                    state.counters["polls_xzone"] += 1
+                    state.counters["poll_bytes_xzone"] += len(body)
+            return body.decode(errors="replace")
+        return http_get
+
+
+
+    def discovery_loop(state):
+        while True:
+            try:
+                pods = state.disc.pods()
+                nodes = state.disc.node_zones()
+                peers = state.disc.peers() if state.a.mode == "node" else []
+                routers = state.disc.routers() if (state.a.mode == "central" and state.a.opt) else []
+                with state.lock:
+                    state.nodes = nodes
+                    state.peers = peers
+                    state.routers = routers
+                    state.pod_list = pods
+                    gone = set(state.local) - {p["pod"] for p in pods}
+                    if gone:
+                        state.bump({state.local[g]["model"] for g in gone})
+                    for g in gone:
+                        del state.local[g]
+                state.load_policy()
+            except Exception as e:
+                log("scoperta fallita:", type(e).__name__, e)
+            time.sleep(state.a.discovery_interval)
+
+
+    def poll_loop(state):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+        def one(p):
+            signals = {}
+            hg = http_get_factory(state, p)
+            for name, fn in COLLECTORS.items():
+                try:
+                    signals.update(fn(p, hg))
+                except Exception as e:
+                    state.count("poll_errors")
+                    signals["error"] = f"{name}: {type(e).__name__}"
+            state.count("polls")
+            return dict(p, signals=signals, ts=time.time(), source=state.a.node or "central")
+
+        while True:
+            t0 = time.time()
+            pods = list(state.pod_list)
+            results = list(pool.map(one, pods)) if pods else []
+            with state.lock:
+                changed = set()
+                for e in results:
+                    old = state.local.get(e["pod"])
+                    if old is None or ekey(old) != ekey(e):
+                        changed.add(e["model"])
+                    state.local[e["pod"]] = e
+                if changed:
+                    state.bump(changed)
+            if changed:
+                state.changed_ev.set()
+            time.sleep(max(0.0, state.a.interval - (time.time() - t0)))
+
+
+    def push_loop(state):
+        last_sent = {}
+        last_hb = 0.0
+        known_peers = set()
+        busy = set()
+        busy_lock = threading.Lock()
+        samples = {}
+
+        def rtt_sample(node, dt):
+            s = samples.setdefault(node, [])
+            s.append(dt)
+            del s[:-10]
+            with state.lock:
+                state.rtt[node] = min(s)
+
+        def send(peer, msg):
+            data = json.dumps(msg, separators=(",", ":")).encode()
+            req = urllib.request.Request(peer["url"] + "/update", data=data,
+                                         headers={"Content-Type": "application/json"})
+            t0 = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=1.0) as r:
+                    resp = r.read()
+                if state.a.opt:
+                    rtt_sample(peer["node"], time.time() - t0)
+                state.count_exchange(peer["node"], len(data) + len(resp), "push_msgs")
+            except Exception:
+                state.count("push_errors")
+            finally:
+                with busy_lock:
+                    busy.discard(peer["url"])
+
+        def pull(peer):
+            try:
+                with urllib.request.urlopen(peer["url"] + "/local", timeout=1.0) as r:
+                    raw = r.read()
+                state.count_exchange(peer["node"], len(raw), "pulls")
+                apply_update(state, json.loads(raw), len(raw))
+            except Exception:
+                state.count("push_errors")
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+        pending = False
+        while True:
+            if state.a.opt:
+                state.changed_ev.wait(timeout=state.a.interval if pending else state.a.interval * 4)
+                state.changed_ev.clear()
+            else:
+                time.sleep(state.a.interval)
+            now = time.time()
+            with state.lock:
+                local = dict(state.local)
+                peers = list(state.peers)
+                want = set(state.need_pull)
+                state.need_pull.clear()
+            hb = now - last_hb >= state.a.heartbeat
+            new_peers = [p for p in peers if p["url"] not in known_peers]
+            known_peers = {p["url"] for p in peers}
+            for u in set(last_sent) - known_peers:
+                del last_sent[u]
+            pending = False
+            for peer in peers:
+                if peer in new_peers or peer["node"] in want:
+                    pool.submit(pull, peer)
+            for peer in peers:
+                sent = last_sent.setdefault(peer["url"], {})
+                changed = [e for p, e in local.items() if sent.get(p) != ekey(e)]
+                is_new = peer in new_peers
+                if state.a.opt:
+                    if is_new:
+                        msg = {"from": state.a.node, "sent": now, "full": True, "entries": list(local.values())}
+                    elif changed:
+                        msg = {"from": state.a.node, "sent": now, "t": "chg",
+                               "e": [{"pod": e["pod"], "s": e["signals"], "r": e["ready"], "n": e["slots"],
+                                      "ts": e["ts"]} for e in changed]}
+                    elif hb:
+                        msg = {"from": state.a.node, "sent": now, "t": "hb", "pods": sorted(local)}
+                    else:
+                        continue
+                else:
+                    if not (changed or hb or is_new):
+                        continue
+                    full = hb or is_new
+                    msg = {"from": state.a.node, "sent": now, "full": full,
+                           "entries": list(local.values()) if full else changed}
+                with busy_lock:
+                    if peer["url"] in busy:
+                        pending = pending or bool(changed)
+                        continue
+                    busy.add(peer["url"])
+                pool.submit(send, peer, msg)
+                for e in (local.values() if (is_new or msg.get("full")) else changed):
+                    sent[e["pod"]] = ekey(e)
+                for p in set(sent) - set(local):
+                    del sent[p]
+            if hb:
+                last_hb = now
+
+
+    def router_push_loop(state):
+        delivered = {}          
+        last_push = {}
+        busy = set()
+        busy_lock = threading.Lock()
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
+        def push(router, body, version):
+            data = json.dumps(body, separators=(",", ":")).encode()
+            req = urllib.request.Request(router["url"] + "/routing-update", data=data,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=1.0) as r:
+                    r.read()
+                with state.lock:                            
+                    state.counters["table_bytes"] += len(data)
+                    state.counters["table_pushes"] = state.counters.get("table_pushes", 0) + 1
+                delivered[router["url"]] = version
+            except Exception:
+                state.count("push_errors")
+                delivered.pop(router["url"], None)          
+            finally:
+                with busy_lock:
+                    busy.discard(router["url"])
+
+        while True:
+            with state.lock:
+                state.cond.wait(timeout=0.2)
+                routers = list(state.routers)
+                version = state.version
+            now = time.time()
+            for u in set(delivered) - {r["url"] for r in routers}:
+                delivered.pop(u, None)
+            for router in routers:
+                have = delivered.get(router["url"])
+                if have is not None and have >= version and now - last_push.get(router["url"], 0) < state.a.keepalive:
+                    continue
+                with busy_lock:
+                    if router["url"] in busy:
+                        continue
+                    busy.add(router["url"])
+                body = state.table(since=have)               
+                last_push[router["url"]] = now
+                pool.submit(push, router, body, body["version"])
+
+
+    def ping_loop(state):
+        samples = {}
+        while True:
+            with state.lock:
+                peers = list(state.peers)
+            for peer in peers:
+                t0 = time.time()
+                try:
+                    with urllib.request.urlopen(peer["url"] + "/healthz", timeout=1.0) as r:
+                        body = r.read()
+                except Exception:
+                    continue
+                state.count_exchange(peer["node"], len(body), "pings")
+                s = samples.setdefault(peer["node"], [])
+                s.append(time.time() - t0)
+                del s[:-10]
+                with state.lock:
+                    state.rtt[peer["node"]] = min(s)
+            time.sleep(state.a.ping_interval)
+
+
+    def apply_update(state, msg, size):
+        now = time.time()
+        src = msg.get("from", "?")
+        with state.lock:
+            state.counters["recv_msgs"] += 1
+            state.counters["recv_bytes"] += size
+            r = state.remote.setdefault(src, {"received": 0, "last_sent": 0, "entries": {}})
+            touched = set()
+            if msg.get("full") or "entries" in msg:
+                if msg.get("full"):
+                    touched |= {e["model"] for e in r["entries"].values()}
+                    r["entries"] = {}
+                for e in msg.get("entries", []):
+                    old = r["entries"].get(e["pod"])
+                    if not msg.get("full") and old is not None and ekey(old) != ekey(e):
+                        state.counters["chg_delay_sum"] += max(0.0, now - e["ts"])
+                        state.counters["chg_delay_n"] += 1
+                    r["entries"][e["pod"]] = e
+                    touched.add(e["model"])
+            elif msg.get("t") == "chg":
+                for c in msg.get("e", []):
+                    base = r["entries"].get(c["pod"])
+                    if base is None:                       
+                        state.need_pull.add(src)
+                        continue
+                    r["entries"][c["pod"]] = dict(base, signals=c["s"], ready=c["r"], slots=c["n"], ts=c["ts"])
+                    state.counters["chg_delay_sum"] += max(0.0, now - c["ts"])
+                    state.counters["chg_delay_n"] += 1
+                    touched.add(base["model"])
+            elif msg.get("t") == "hb":
+                pods = set(msg.get("pods", []))
+                for p in list(r["entries"]):
+                    if p not in pods:
+                        touched.add(r["entries"][p]["model"])
+                        del r["entries"][p]
+                if pods - set(r["entries"]):
+                    state.need_pull.add(src)
+            r["received"] = now
+            r["last_sent"] = float(msg.get("sent", 0))
+            if touched:
+                state.bump(touched)
+
+
+
+    def make_handler(state):
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj):
+                body = json.dumps(obj, separators=(",", ":")).encode()
+                if self.path.startswith("/table"):
+                    state.count("table_bytes", len(body))
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.startswith("/table"):
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    since = int(q["since"][0]) if q.get("since", [""])[0].isdigit() else None
+                    return self._send(200, state.table(since))
+                if self.path.startswith("/local"):
+                    with state.lock:
+                        entries = list(state.local.values())
+                    return self._send(200, {"from": state.a.node, "sent": time.time(), "full": True, "entries": entries})
+                if self.path.startswith("/healthz"):
+                    return self._send(200, {"ok": True})
+                self._send(404, {"error": "not found"})
+
+            def do_POST(self):
+                if not self.path.startswith("/update"):
+                    return self._send(404, {"error": "not found"})
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n)
+                try:
+                    apply_update(state, json.loads(raw), n)
+                except (ValueError, KeyError):
+                    return self._send(400, {"error": "json"})
+                self._send(200, {"ok": True})
+        return H
+
+
+    def parse_args():
+        env = os.environ.get
+        ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        ap.add_argument("--mode", default=env("ROUTING_MODE", "central"), choices=["central", "node", "off"])
+        ap.add_argument("--opt", type=int, default=int(env("ROUTING_OPT", "0")),
+                        help="1 = versione ottimizzata (central: spinge ai router solo i cambiamenti; node: messaggi compatti, battito 3 s, niente ping)")
+        ap.add_argument("--node", default=env("NODE_NAME", ""))
+        ap.add_argument("--namespace", default=env("POD_NAMESPACE", "default"))
+        ap.add_argument("--port", type=int, default=int(env("AGENT_PORT", "9100")))
+        ap.add_argument("--interval", type=float, default=float(env("POLL_INTERVAL_S", "0.25")))
+        ap.add_argument("--heartbeat", type=float, default=float(env("HEARTBEAT_S", "0")) or None)
+        ap.add_argument("--router-port", type=int, default=int(env("ROUTER_CONTROL_PORT", "9180")),
+                        help="central-opt: porta di controllo di nginx su cui spingere la tabella")
+        ap.add_argument("--keepalive", type=float, default=float(env("KEEPALIVE_S", "1.5")),
+                        help="central-opt: conferma ai router se non cambia nulla (sotto staleS)")
+        ap.add_argument("--ping-interval", type=float, default=float(env("PING_INTERVAL_S", "1")))
+        ap.add_argument("--discovery-interval", type=float, default=float(env("DISCOVERY_INTERVAL_S", "5")))
+        ap.add_argument("--poll-timeout", type=float, default=float(env("POLL_TIMEOUT_S", "0.5")))
+        ap.add_argument("--policy-file", default=env("POLICY_FILE", "/etc/routing/policy.json"))
+        ap.add_argument("--model-selector", default=env("MODEL_SELECTOR", "app=localai-standalone,component=model"))
+        ap.add_argument("--peer-selector", default=env("PEER_SELECTOR", "app=localai-router"))
+        ap.add_argument("--zone-label", default=env("ZONE_LABEL", "topology.kubernetes.io/zone"))
+        ap.add_argument("--app-port", type=int, default=int(env("APP_PORT", "8080")))
+        ap.add_argument("--metrics-port", type=int, default=int(env("METRICS_PORT", "15090")))
+        ap.add_argument("--static-file", default=env("STATIC_FILE", ""), help="prove locali: pod e peer da file")
+        a = ap.parse_args()
+        a.opt = bool(a.opt)
+        if not a.heartbeat:
+            a.heartbeat = 3.0 if a.opt else 1.0
+        return a
+
+
+    def main():
+        a = parse_args()
+        if a.mode == "off":
+            log("modalità off: nessuna raccolta")
+            while True:
+                time.sleep(3600)
+        if a.mode == "node" and not a.node:
+            raise SystemExit("modalità node: serve NODE_NAME")
+        disc = StaticDiscovery(a) if a.static_file else K8sDiscovery(a)
+        state = State(a, disc)
+        state.load_policy()
+        threading.Thread(target=discovery_loop, args=(state,), daemon=True).start()
+        threading.Thread(target=poll_loop, args=(state,), daemon=True).start()
+        if a.mode == "central" and a.opt:
+            threading.Thread(target=router_push_loop, args=(state,), daemon=True).start()
+        if a.mode == "node":
+            threading.Thread(target=push_loop, args=(state,), daemon=True).start()
+            if not a.opt:
+                threading.Thread(target=ping_loop, args=(state,), daemon=True).start()
+        log(f"agente {a.mode}{' ottimizzato' if a.opt else ''} su :{a.port}, nodo={a.node or '-'}, "
+            f"lettura ogni {a.interval}s, battito {a.heartbeat}s")
+        ThreadingHTTPServer(("0.0.0.0", a.port), make_handler(state)).serve_forever()
+
+
+    if __name__ == "__main__":
+        main()
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localai-routing-policy
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-router
+data:
+  policy.json: |
+    {
+      "weights": {"queue": 1, "network": 1},
+      "serviceTimeS": {"default": 1.0, "qwen2-5-0-5b-instruct": 0.9, "llama-3-2-1b-instruct": 2.0},
+      "networkRttS": {"sameNode": 0, "sameZone": 0.001, "crossZone": 0.07},
+      "networkSource": "measured",
+      "networkRttMultiplier": 2,
+      "staleS": 3,
+      "hysteresisS": 0.2
+    }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: localai-router
+  namespace: {{ .namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: localai-routing-{{ .namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: localai-routing-{{ .namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: localai-routing-{{ .namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: localai-router
+    namespace: {{ .namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localai-routing-collector
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-routing-collector
+spec:
+  replicas: {{ if eq $routing "central" }}1{{ else }}0{{ end }}
+  selector:
+    matchLabels:
+      app: localai-routing-collector
+  template:
+    metadata:
+      labels:
+        app: localai-routing-collector
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      schedulerName: {{ .schedulerName }}
+      serviceAccountName: localai-router
+      containers:
+        - name: routing-agent
+          image: {{ $agentImage }}
+          command: ["python3", "-u", "/etc/routing/routing-agent.py"]
+          env:
+            - { name: ROUTING_MODE, value: central }
+            - { name: NODE_NAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }   
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: POLICY_FILE, value: /etc/routing-policy/policy.json }
+            - { name: ROUTING_OPT, value: "{{ $routingOpt }}" }
+          ports:
+            - { name: table, containerPort: 9100 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: table }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+          volumeMounts:
+            - { name: conf, mountPath: /etc/routing/routing-agent.py, subPath: routing-agent.py }
+            - { name: policy, mountPath: /etc/routing-policy }
+      volumes:
+        - { name: conf, configMap: { name: localai-router-conf } }
+        - { name: policy, configMap: { name: localai-routing-policy } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: localai-routing-collector
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-routing-collector
+spec:
+  selector:
+    app: localai-routing-collector
+  ports:
+    - { name: http-table, port: 9100, targetPort: table }
 {{- range $node := .proxyNodes }}
 ---
 apiVersion: apps/v1
@@ -399,19 +1421,29 @@ spec:
         app: localai-router
         component: node-proxy
         router-node: "{{ $node }}"
+      {{- if ne $routing "istio" }}
+      annotations:
+        traffic.sidecar.istio.io/excludeOutboundPorts: "8080,15090,9100"
+        traffic.sidecar.istio.io/excludeInboundPorts: "9100,9180"
+      {{- end }}
     spec:
       schedulerName: {{ $.schedulerName }}
+      serviceAccountName: localai-router
       nodeSelector:
         kubernetes.io/hostname: {{ $node }}
       tolerations:
         - operator: Exists
       containers:
         - name: nginx
-          # Immagine ufficiale: include il modulo njs.
           image: nginx:1.27-alpine
+          env:
+            - { name: ROUTING_TABLE_URL, value: "{{ $tableUrl }}" }
+            - { name: NODE_NAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }
           ports:
             - name: http
               containerPort: 8080
+            - name: control
+              containerPort: 9180
           readinessProbe:
             httpGet: { path: /nginx-healthz, port: http }
             periodSeconds: 5
@@ -421,14 +1453,28 @@ spec:
           volumeMounts:
             - { name: conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf }
             - { name: conf, mountPath: /etc/nginx/njs/router.js, subPath: router.js }
+        - name: routing-agent
+          image: {{ $agentImage }}
+          command: ["python3", "-u", "/etc/routing/routing-agent.py"]
+          env:
+            - { name: ROUTING_MODE, value: "{{ if eq $routing "node" }}node{{ else }}off{{ end }}" }
+            - { name: NODE_NAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: POLICY_FILE, value: /etc/routing-policy/policy.json }
+            - { name: ROUTING_OPT, value: "{{ $routingOpt }}" }
+          ports:
+            - { name: table, containerPort: 9100 }
+          resources:
+            requests: { cpu: 20m, memory: 24Mi }
+            limits: { cpu: 300m, memory: 96Mi }
+          volumeMounts:
+            - { name: conf, mountPath: /etc/routing/routing-agent.py, subPath: routing-agent.py }
+            - { name: policy, mountPath: /etc/routing-policy }
       volumes:
-        - name: conf
-          configMap:
-            name: localai-router-conf
+        - { name: conf, configMap: { name: localai-router-conf } }
+        - { name: policy, configMap: { name: localai-routing-policy } }
 {{- end }}
 ---
-# Ingresso di questa application per il load-gen: NodePort sui router condivisi.
-# externalTrafficPolicy Local: la richiesta resta sul nodo da cui entra.
 apiVersion: v1
 kind: Service
 metadata:
