@@ -186,12 +186,14 @@ data:
         js_shared_dict_zone zone=rt_sent:1m type=number timeout=10s evict;
         js_shared_dict_zone zone=rt_stats:64k type=number;
         js_set $rt_upstream router.pickUpstream;
+        js_shared_dict_zone zone=rt_obs:64k type=number;
+        js_set $rt_observe router.observe;
         js_var $rt_info "-";
 
         resolver 10.43.0.10 valid=10s ipv6=off;
         resolver_timeout 2s;
 
-        log_format route '$time_iso8601 $remote_addr "$request" model=$mid via=$via status=$status '
+        log_format route '$time_iso8601 $remote_addr "$request" model=$mid via=$via status=$status $rt_observe '
                          'rt=$request_time urt=$upstream_response_time upstream=$upstream_addr route="$rt_info"';
         map $hdr_mid $via { "" body; default header; }
         access_log /dev/stdout route;
@@ -329,9 +331,6 @@ data:
 
     var DEFAULT_POLICY = {
         weights: { queue: 1, network: 1 },
-        serviceTimeS: { 'default': 1.0 },
-        networkRttS: { sameNode: 0, sameZone: 0.001, crossZone: 0.07 },
-        networkSource: 'measured',
         networkRttMultiplier: 2,
         staleS: 3,
         hysteresisS: 0.2,
@@ -369,7 +368,7 @@ data:
             if (p.signals && p.signals.active !== undefined) {
                 busy = p.signals.active + c.sentSince(p);
             } else {
-                busy = c.sentWithin(p, c.serviceTime(p) * c.policy.remoteWindowFactor);
+                busy = c.sentWithin(p, Math.max(c.serviceTime(p), 0.5) * c.policy.remoteWindowFactor);
             }
             var waiting = Math.max(0, busy - slots + 1);
             return waiting * c.serviceTime(p) / slots;
@@ -392,26 +391,26 @@ data:
         var nodes = (meta && meta.nodes) || {};
         var rtts = (meta && meta.rtt) || {};
         var links = (meta && meta.links) || {};
-        var selfZone = nodes[selfNode] || '';
         return {
             policy: policy,
             now: now,
             confirmed: (meta && meta.confirmed) || 0,
             selfNode: selfNode,
             serviceTime: function (p) {
-                var st = policy.serviceTimeS || {};
-                return st[p.model] || st['default'] || 1.0;
+                if (p.signals && p.signals.r !== undefined) {
+                    return p.signals.r;
+                }
+                if (this.modelR !== undefined) {
+                    return this.modelR;
+                }
+                return observed(p.model) || 0;
             },
+            modelR: undefined,
             rtt: function (p) {
-                var n = policy.networkRttS;
                 if (p.node === selfNode) {
-                    return n.sameNode || 0;
+                    return 0;
                 }
-                if (policy.networkSource === 'measured' && rtts[p.node] !== undefined) {
-                    return rtts[p.node];
-                }
-                var z = p.zone || nodes[p.node] || '';
-                return (selfZone && z === selfZone) ? n.sameZone : n.crossZone;
+                return (rtts[p.node] !== undefined) ? rtts[p.node] : 0;
             },
             sentSince: function (p) {
                 return sentLookup(p.addr, p.ts, now);
@@ -484,6 +483,34 @@ data:
         ngx.shared.rt_sent.incr(addr + '|' + Math.floor(now * 1000 / BUCKET_MS), 1, 0);
     }
 
+    var OBS_ALPHA = 0.2;
+
+    function observed(model) {
+        try {
+            return ngx.shared.rt_obs.get(model) || 0;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    function observe(r) {
+        var mid = r.variables.mid;
+        var t = String(r.variables.upstream_response_time || '').split(/[,:]\s*/).pop();
+        var v = parseFloat(t);
+        if (mid && mid !== '-' && v > 0 && r.variables.status === '200') {
+            var d = ngx.shared.rt_obs;
+            var old = d.get(mid);
+            d.set(mid, old === undefined ? v : old + OBS_ALPHA * (v - old));
+        }
+        return '';
+    }
+
+    function medianR(pods) {
+        var rs = pods.filter(function (p) { return p.signals && p.signals.r !== undefined; })
+                     .map(function (p) { return p.signals.r; }).sort(function (a, b) { return a - b; });
+        return rs.length ? rs[Math.floor(rs.length / 2)] : undefined;
+    }
+
     function pickUpstream(r) {
         var mid = r.variables.mid;
         var fallback = r.variables.svc + ':8080';
@@ -497,7 +524,9 @@ data:
         var meta = JSON.parse(metaRaw);
         meta.confirmed = parseFloat(ngx.shared.rt.get('confirmed') || '0');
         var c = makeContext(meta, mid, process.env.NODE_NAME || '', now, sentLookupShared);
-        var res = choose(JSON.parse(raw), c);
+        var pods = JSON.parse(raw);
+        c.modelR = medianR(pods);
+        var res = choose(pods, c);
         if (!res) {
             r.variables.rt_info = 'service(no-candidate)';
             return fallback;
@@ -603,7 +632,8 @@ data:
 
     function dumpTable(r) {
         var d = ngx.shared.rt;
-        var out = { node: process.env.NODE_NAME || '', meta: null, models: {}, stats: {} };
+        var out = { node: process.env.NODE_NAME || '', meta: null, models: {}, stats: {}, observed: {} };
+        ngx.shared.rt_obs.keys().forEach(function (k) { out.observed[k] = ngx.shared.rt_obs.get(k); });
         var st = ngx.shared.rt_stats;
         st.keys().forEach(function (k) { out.stats[k] = st.get(k); });
         d.keys().forEach(function (k) {
@@ -625,7 +655,7 @@ data:
         r.return(200, JSON.stringify(out) + '\n');
     }
 
-    export default { route, modelId, idFromHeader, pickUpstream, refresh, update, dumpTable,
+    export default { route, modelId, idFromHeader, pickUpstream, observe, refresh, update, dumpTable, medianR,
                      choose, makeContext, SCORERS, FILTERS, DEFAULT_POLICY };
   routing-agent.py: |
     import argparse
@@ -916,7 +946,7 @@ data:
                         self.bump({e["model"] for e in r["entries"].values()})
                         del self.remote[src]
                 links = {}
-                if self.a.mode == "broker" and now - self.net_ts <= self.a.net_stale:
+                if self.a.mode == "broker" and (self.a.net_stale <= 0 or now - self.net_ts <= self.a.net_stale):
                     links = self.links
                 rtt = {k: v["rtt"] for k, v in links.items() if v.get("rtt") is not None} if self.a.mode == "broker" \
                     else {k: round(v, 4) for k, v in self.rtt.items()}
@@ -1902,8 +1932,8 @@ data:
         ap.add_argument("--mqtt-keepalive", type=int, default=int(env("MQTT_KEEPALIVE_S", "30")))
         ap.add_argument("--broker-grace", type=float, default=float(env("BROKER_GRACE_S", "30")),
                         help="broker: per quanto i pod degli altri nodi restano validi dopo una disconnessione dal broker")
-        ap.add_argument("--net-stale", type=float, default=float(env("NET_STALE_S", "180")),
-                        help="broker: riga di rete più vecchia di così = ignorata (valori statici per zona)")
+        ap.add_argument("--net-stale", type=float, default=float(env("NET_STALE_S", "0")),
+                        help="broker: età massima della riga di rete (0 = nessuna: vale l'ultima misura ricevuta)")
         ap.add_argument("--prometheus-url", default=env("PROMETHEUS_URL", "auto"),
                         help='"auto" (o vuota) = cerca nel cluster la Service di Prometheus con le metriche di Mentat')
         ap.add_argument("--prom-interval", type=float, default=float(env("PROM_INTERVAL_S", "30")),
@@ -2002,9 +2032,6 @@ data:
   policy.json: |
     {
       "weights": {"queue": 1, "network": 1, "loss": 1, "bandwidth": 1},
-      "serviceTimeS": {"default": 1.0, "qwen2-5-0-5b-instruct": 0.9, "llama-3-2-1b-instruct": 2.0},
-      "networkRttS": {"sameNode": 0, "sameZone": 0.001, "crossZone": 0.07},
-      "networkSource": "measured",
       "networkRttMultiplier": 2,
       "staleS": 3,
       "hysteresisS": 0.2,
@@ -2188,7 +2215,6 @@ spec:
         app: localai-router
         component: node-proxy
         router-node: "{{ $node }}"
-        version: "{{ $node }}"
       annotations:
         traffic.sidecar.istio.io/excludeOutboundPorts: "8080,1883"
         traffic.sidecar.istio.io/excludeInboundPorts: "9100"
