@@ -1,0 +1,2264 @@
+{{- $image := or (index . "localaiImage") "quay.io/go-skynet/local-ai:v4.7.1" -}}
+{{- $replicas := or (index . "minReplicas") 1 -}}
+{{- $cpuReq := or (index . "cpuRequest") "2" -}}
+{{- $memReq := or (index . "memoryRequest") "2Gi" -}}
+{{- $cpuLim := or (index . "cpuLimit") "4" -}}
+{{- $threads := or (index . "threads") 4 -}}
+{{- $backendsPath := or (index . "backendsPath") "/backends/v4.7.1-amd64" -}}
+{{- $agentImage := or (index . "agentImage") "python:3.12-alpine" -}}
+{{- $prometheusUrl := or (index . "prometheusUrl") "auto" -}}
+{{- $brokerNode := or (index . "brokerNode") "" -}}
+{{- $brokerImage := or (index . "brokerImage") "eclipse-mosquitto:2.0.20" -}}
+{{- if .modelConfig }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-ai-{{ .group }}-model
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    app: localai-standalone
+data:
+  {{ .modelConfig }}: |
+{{ indent 4 (index . "modelConfigContent") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: local-ai-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    app: localai-standalone
+    component: model
+    model: "{{ .group }}"
+  annotations:
+    localai.testbed/model-config: "{{ .modelConfig }}"
+spec:
+  replicas: {{ $replicas }}
+  selector:
+    matchLabels:
+      group: "{{ .group }}"
+      component: model
+  template:
+    metadata:
+      labels:
+        group: "{{ .group }}"
+        app: localai-standalone
+        component: model
+        model: "{{ .group }}"
+      annotations:
+        localai-backends-path: "{{ $backendsPath }}"
+    spec:
+      schedulerName: {{ .schedulerName }}
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: copy-model-config
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - cp /model-config/{{ .modelConfig }} /models/{{ .modelConfig }} && mkdir -p "$BACKENDS_PATH"
+          env:
+            - name: BACKENDS_PATH
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['localai-backends-path']
+          volumeMounts:
+            - { name: model-config, mountPath: /model-config }
+            - { name: models, mountPath: /models, subPath: "{{ .group }}" }
+            - { name: backends, mountPath: /backends }
+      containers:
+        - name: local-ai
+          image: {{ $image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PRELOAD_MODELS
+              value: '[{"url": "file:///models/{{ .modelConfig }}"}]'
+            - { name: LOCALAI_MODELS_PATH, value: /models }
+            - name: LOCALAI_BACKENDS_PATH
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['localai-backends-path']
+            - { name: LOCALAI_EXTERNAL_BACKENDS, value: "{{ or (index . "externalBackends") "llama-cpp" }}" }
+            - { name: LOCALAI_THREADS, value: "{{ $threads }}" }
+            - { name: LOCALAI_SINGLE_ACTIVE_BACKEND, value: "true" }
+            - { name: LLAMACPP_PARALLEL, value: "{{ or (index . "parallel") 1 }}" }
+            - { name: DEBUG, value: "false" }
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: "{{ $cpuReq }}"
+              memory: "{{ $memReq }}"
+            limits:
+              cpu: "{{ $cpuLim }}"
+              memory: "{{ if index . "workerMemoryLimitGi" }}{{ index . "workerMemoryLimitGi" }}Gi{{ else }}4Gi{{ end }}"
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  m=$(curl -sf -m 5 http://127.0.0.1:8080/v1/models | grep -o '"id":"[^"]*"' | head -n1 | cut -d'"' -f4)
+                  [ -n "$m" ] || exit 1
+                  curl -sf -m 120 -H 'Content-Type: application/json' \
+                    -d "{\"model\":\"$m\",\"prompt\":\"ok\",\"max_tokens\":1}" \
+                    http://127.0.0.1:8080/v1/completions >/dev/null
+            periodSeconds: 15
+            timeoutSeconds: 130
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - { name: models, mountPath: /models, subPath: "{{ .group }}" }
+            - { name: backends, mountPath: /backends }
+      volumes:
+        - name: model-config
+          configMap:
+            name: local-ai-{{ .group }}-model
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ .models_pvc }}
+        - name: backends
+          persistentVolumeClaim:
+            claimName: {{ .backend_pvc }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: local-ai-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    app: localai-standalone
+    component: model
+spec:
+  type: ClusterIP
+  selector:
+    group: "{{ .group }}"
+    component: model
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: http
+{{- end }}
+{{- if .proxyNodes }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localai-router-conf
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-router
+data:
+  nginx.conf: |
+    load_module modules/ngx_http_js_module.so;
+
+    worker_processes auto;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+
+    env ROUTING_TABLE_URL;
+    env NODE_NAME;
+
+    events {
+        worker_connections 4096;
+    }
+
+    http {
+        js_path /etc/nginx/njs/;
+        js_import router from router.js;
+
+        js_set $hdr_mid router.idFromHeader;
+
+        js_shared_dict_zone zone=rt:4m timeout=10s evict;
+        js_shared_dict_zone zone=rt_sent:1m type=number timeout=10s evict;
+        js_shared_dict_zone zone=rt_stats:64k type=number;
+        js_set $rt_upstream router.pickUpstream;
+        js_var $rt_info "-";
+
+        resolver 10.43.0.10 valid=10s ipv6=off;
+        resolver_timeout 2s;
+
+        log_format route '$time_iso8601 $remote_addr "$request" model=$mid via=$via status=$status '
+                         'rt=$request_time urt=$upstream_response_time upstream=$upstream_addr route="$rt_info"';
+        map $hdr_mid $via { "" body; default header; }
+        access_log /dev/stdout route;
+
+        client_max_body_size    25m;
+        client_body_buffer_size 25m;
+
+        server {
+            listen 8080;
+
+            set $mid "-";
+
+            location = /nginx-healthz {
+                access_log off;
+                return 200 "ok\n";
+            }
+
+            location @periodics {
+                js_periodic router.refresh interval=250ms;
+            }
+
+            location = /routing-table {
+                access_log off;
+                js_content router.dumpTable;
+            }
+
+            location / {
+                if ($hdr_mid) {
+                    rewrite ^ /_m/$hdr_mid$uri last;
+                }
+                js_content router.route;
+            }
+
+            location ~ ^/_m/(?<mid>[a-z0-9-]+)(?<rest>/.*)$ {
+                internal;
+
+                set $svc local-ai-$mid.{{ $.namespace }}.svc.cluster.local;
+                proxy_pass http://$rt_upstream$rest$is_args$args;
+
+                proxy_set_header Host $svc;
+                proxy_set_header X-Model-Id $mid;
+                proxy_set_header X-LocalAI-Gateway $hostname;
+
+                add_header X-LocalAI-Gateway $hostname always;
+                add_header X-LocalAI-Model-Id $mid always;
+                add_header X-LocalAI-Route $rt_info always;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+
+                proxy_buffering off;
+                proxy_request_buffering off;
+                proxy_read_timeout 900s;
+                proxy_send_timeout 900s;
+                proxy_connect_timeout 5s;
+
+                proxy_intercept_errors off;
+                error_page 502 503 504 = @unavailable;
+            }
+
+            location @unavailable {
+                default_type application/json;
+                return 503 '{"error":{"message":"modello non disponibile: deployment local-ai-$mid assente nel namespace {{ $.namespace }} o senza pod pronti","type":"model_unavailable","code":503}}\n';
+            }
+        }
+
+        server {
+            listen 9180;
+            access_log off;
+            location = /routing-update {
+                js_content router.update;
+            }
+            location / {
+                return 404;
+            }
+        }
+    }
+  router.js: |
+    function modelId(name) {
+        return String(name)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+/, '')
+            .replace(/-+$/, '')
+            .slice(0, 40)
+            .replace(/-+$/, '');
+    }
+
+    function jsonError(r, status, message, type) {
+        r.headersOut['Content-Type'] = 'application/json';
+        r.return(status, JSON.stringify({ error: { message: message, type: type, code: status } }) + '\n');
+    }
+
+    function extractModel(r) {
+        var body;
+        try {
+            body = r.requestText;
+        } catch (e) {
+            return null;
+        }
+        if (!body) {
+            return null;
+        }
+        var ct = r.headersIn['Content-Type'] || '';
+        if (ct.indexOf('multipart/form-data') !== -1) {
+            var m = body.match(/name="model"\r\n\r\n([^\r\n]+)/);
+            return m ? m[1] : null;
+        }
+        try {
+            var j = JSON.parse(body);
+            return (j && typeof j.model === 'string') ? j.model : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function route(r) {
+        var model = r.headersIn['X-Model'] || extractModel(r);
+        if (!model) {
+            return jsonError(r, 400,
+                'impossibile determinare il modello: serve il campo "model" nel body JSON o l\'header X-Model',
+                'invalid_request_error');
+        }
+        var id = modelId(model);
+        if (!id) {
+            return jsonError(r, 400, 'nome modello non valido: ' + model, 'invalid_request_error');
+        }
+        var args = r.variables.args;
+        r.internalRedirect('/_m/' + id + r.uri + (args ? '?' + args : ''));
+    }
+
+    function idFromHeader(r) {
+        var h = r.headersIn['X-Model'];
+        return h ? modelId(h) : '';
+    }
+
+    var DEFAULT_POLICY = {
+        weights: { queue: 1, network: 1 },
+        serviceTimeS: { 'default': 1.0 },
+        networkRttS: { sameNode: 0, sameZone: 0.001, crossZone: 0.07 },
+        networkSource: 'measured',
+        networkRttMultiplier: 2,
+        staleS: 3,
+        hysteresisS: 0.2,
+        remoteWindowFactor: 1,
+        lossPenaltyS: 2,
+        transferBytes: 16384
+    };
+
+    function policyOf(meta) {
+        var p = (meta && meta.policy) || {};
+        var out = {};
+        for (var k in DEFAULT_POLICY) {
+            out[k] = (p[k] !== undefined) ? p[k] : DEFAULT_POLICY[k];
+        }
+        return out;
+    }
+
+    var FILTERS = [
+        function ready(p) { return p.ready !== false; },
+        function fresh(p, c) { return c.now - Math.max(p.ts, c.confirmed) <= c.policy.staleS; },
+        function noError(p) { return !(p.signals && p.signals.error); }
+    ];
+
+    var SCORERS = {
+        queue: function (p, c) {
+            var sg = p.signals || {};
+            if (sg.r !== undefined) {
+                var since = Math.max(0, Math.min(c.now - p.ts, Math.max(sg.r, 0.5)));
+                var mine = c.sentWithin(p, since);
+                var l = sg.l || 0;
+                return sg.r * (l + 1 + mine) / (l + 1);
+            }
+            var slots = p.slots || 1;
+            var busy;
+            if (p.signals && p.signals.active !== undefined) {
+                busy = p.signals.active + c.sentSince(p);
+            } else {
+                busy = c.sentWithin(p, c.serviceTime(p) * c.policy.remoteWindowFactor);
+            }
+            var waiting = Math.max(0, busy - slots + 1);
+            return waiting * c.serviceTime(p) / slots;
+        },
+        network: function (p, c) {
+            return c.rtt(p) * c.policy.networkRttMultiplier;
+        },
+        loss: function (p, c) {
+            var l = c.link(p);
+            return (l.loss || 0) * c.policy.lossPenaltyS;
+        },
+        bandwidth: function (p, c) {
+            var l = c.link(p);
+            return (l.bw > 0) ? c.policy.transferBytes / l.bw : 0;
+        }
+    };
+
+    function makeContext(meta, model, selfNode, now, sentLookup) {
+        var policy = policyOf(meta);
+        var nodes = (meta && meta.nodes) || {};
+        var rtts = (meta && meta.rtt) || {};
+        var links = (meta && meta.links) || {};
+        var selfZone = nodes[selfNode] || '';
+        return {
+            policy: policy,
+            now: now,
+            confirmed: (meta && meta.confirmed) || 0,
+            selfNode: selfNode,
+            serviceTime: function (p) {
+                var st = policy.serviceTimeS || {};
+                return st[p.model] || st['default'] || 1.0;
+            },
+            rtt: function (p) {
+                var n = policy.networkRttS;
+                if (p.node === selfNode) {
+                    return n.sameNode || 0;
+                }
+                if (policy.networkSource === 'measured' && rtts[p.node] !== undefined) {
+                    return rtts[p.node];
+                }
+                var z = p.zone || nodes[p.node] || '';
+                return (selfZone && z === selfZone) ? n.sameZone : n.crossZone;
+            },
+            sentSince: function (p) {
+                return sentLookup(p.addr, p.ts, now);
+            },
+            sentWithin: function (p, s) {
+                return sentLookup(p.addr, now - s, now);
+            },
+            link: function (p) {
+                return (p.node === selfNode) ? {} : (links[p.node] || {});
+            }
+        };
+    }
+
+    function choose(pods, c, rnd) {
+        var cands = [];
+        for (var i = 0; i < pods.length; i++) {
+            var p = pods[i];
+            var ok = true;
+            for (var f = 0; f < FILTERS.length && ok; f++) {
+                ok = FILTERS[f](p, c);
+            }
+            if (!ok) {
+                continue;
+            }
+            var parts = {};
+            var total = 0;
+            for (var name in SCORERS) {
+                var w = (c.policy.weights || {})[name];
+                if (!w) {
+                    continue;
+                }
+                var v = SCORERS[name](p, c);
+                parts[name] = v;
+                total += w * v;
+            }
+            cands.push({ pod: p, cost: total, parts: parts });
+        }
+        if (!cands.length) {
+            return null;
+        }
+        var best = Infinity;
+        for (var j = 0; j < cands.length; j++) {
+            best = Math.min(best, cands[j].cost);
+        }
+        var near = cands.filter(function (x) { return x.cost <= best + c.policy.hysteresisS; });
+        var minNet = Infinity;
+        near.forEach(function (x) { minNet = Math.min(minNet, x.parts.network || 0); });
+        var finalists = near.filter(function (x) { return (x.parts.network || 0) <= minNet + 1e-9; });
+        var pick = finalists[Math.floor((rnd || Math.random)() * finalists.length)];
+        return { pick: pick, candidates: cands };
+    }
+
+    var BUCKET_MS = 100;
+
+    function sentLookupShared(addr, ts, now) {
+        var d = ngx.shared.rt_sent;
+        var from = Math.floor(ts * 1000 / BUCKET_MS);
+        var to = Math.floor(now * 1000 / BUCKET_MS);
+        if (to - from > 50) {
+            from = to - 50;
+        }
+        var n = 0;
+        for (var b = from; b <= to; b++) {
+            n += d.get(addr + '|' + b) || 0;
+        }
+        return n;
+    }
+
+    function markSent(addr, now) {
+        ngx.shared.rt_sent.incr(addr + '|' + Math.floor(now * 1000 / BUCKET_MS), 1, 0);
+    }
+
+    function pickUpstream(r) {
+        var mid = r.variables.mid;
+        var fallback = r.variables.svc + ':8080';
+        var raw = ngx.shared.rt.get('m:' + mid);
+        var metaRaw = ngx.shared.rt.get('meta');
+        if (!raw || !metaRaw) {
+            r.variables.rt_info = 'service';
+            return fallback;
+        }
+        var now = Date.now() / 1000;
+        var meta = JSON.parse(metaRaw);
+        meta.confirmed = parseFloat(ngx.shared.rt.get('confirmed') || '0');
+        var c = makeContext(meta, mid, process.env.NODE_NAME || '', now, sentLookupShared);
+        var res = choose(JSON.parse(raw), c);
+        if (!res) {
+            r.variables.rt_info = 'service(no-candidate)';
+            return fallback;
+        }
+        markSent(res.pick.pod.addr, now);
+        var parts = res.pick.parts;
+        r.variables.rt_info = res.pick.pod.pod + ' cost=' + res.pick.cost.toFixed(3) +
+            Object.keys(parts).map(function (k) { return ' ' + k + '=' + parts[k].toFixed(3); }).join('') +
+            ' cands=' + res.candidates.length +
+            ' age=' + (now - Math.max(res.pick.pod.ts, meta.confirmed)).toFixed(3);
+        return res.pick.pod.addr;
+    }
+
+    function ekey(e) {
+        return JSON.stringify([e.ready, e.slots, e.signals]);
+    }
+
+    function touch(d, k) {
+        var v = d.get(k);
+        if (v !== undefined) {
+            d.set(k, v);
+        }
+    }
+
+    function applyTable(t) {
+        var d = ngx.shared.rt;
+        var st = ngx.shared.rt_stats;
+        var now = Date.now() / 1000;
+        var keys = d.keys();
+        if (t.unchanged) {
+            keys.forEach(function (k) { if (k === 'meta' || k.indexOf('m:') === 0) { touch(d, k); } });
+        } else {
+            if (t.policy !== undefined) {
+                d.set('meta', JSON.stringify({ policy: t.policy, nodes: t.nodes, rtt: t.rtt, links: t.links, agent: t.agent,
+                                               generated: t.generated }));
+            } else {
+                touch(d, 'meta');
+            }
+            var models = t.models || {};
+            for (var m in models) {
+                var oldRaw = d.get('m:' + m);
+                var old = {};
+                if (oldRaw) {
+                    JSON.parse(oldRaw).forEach(function (e) { old[e.pod] = ekey(e); });
+                }
+                models[m].forEach(function (e) {
+                    if (oldRaw && old[e.pod] !== ekey(e)) {
+                        st.incr('chg_n', 1, 0);
+                        st.incr('chg_ms', Math.max(0, Math.round((now - (e.mts || e.ts)) * 1000)), 0);
+                    }
+                });
+                d.set('m:' + m, JSON.stringify(models[m]));
+            }
+            var present = t.models_present || Object.keys(models);
+            keys.forEach(function (k) {
+                if (k.indexOf('m:') !== 0) {
+                    return;
+                }
+                if (present.indexOf(k.slice(2)) < 0) {
+                    d.delete(k);
+                } else if (!models[k.slice(2)]) {
+                    touch(d, k);
+                }
+            });
+        }
+        d.set('confirmed', String(t.generated));
+        d.set('version', String(t.version));
+    }
+
+    function update(r) {
+        try {
+            applyTable(JSON.parse(r.requestText));
+            ngx.shared.rt.set('pushed_at', String(Date.now()));
+            ngx.shared.rt_stats.incr('pushes', 1, 0);
+            r.return(200, '{"ok":true}\n');
+        } catch (e) {
+            r.return(400, '{"error":"' + String(e).replace(/"/g, "'") + '"}\n');
+        }
+    }
+
+    async function refresh(s) {
+        var url = process.env.ROUTING_TABLE_URL;
+        if (!url) {
+            return;
+        }
+        var d = ngx.shared.rt;
+        var pushed = parseFloat(d.get('pushed_at') || '0');
+        if (pushed && Date.now() - pushed < 3000) {
+            return;
+        }
+        try {
+            var ver = d.get('version');
+            var u = url + (ver ? (url.indexOf('?') < 0 ? '?' : '&') + 'since=' + ver : '');
+            var res = await ngx.fetch(u, { max_response_body_size: 4194304 });
+            var t = await res.json();
+            applyTable(t);
+            ngx.shared.rt_stats.incr('fetches', 1, 0);
+        } catch (e) {
+            ngx.shared.rt_stats.incr('fetch_errors', 1, 0);
+            ngx.log(ngx.WARN, 'routing: tabella non disponibile da ' + url + ': ' + e);
+        }
+    }
+
+    function dumpTable(r) {
+        var d = ngx.shared.rt;
+        var out = { node: process.env.NODE_NAME || '', meta: null, models: {}, stats: {} };
+        var st = ngx.shared.rt_stats;
+        st.keys().forEach(function (k) { out.stats[k] = st.get(k); });
+        d.keys().forEach(function (k) {
+            if (k === 'pushed_at') {
+                return;
+            }
+            if (k === 'confirmed' || k === 'version') {
+                out[k] = parseFloat(d.get(k));
+                return;
+            }
+            var v = JSON.parse(d.get(k));
+            if (k === 'meta') {
+                out.meta = v;
+            } else if (k.indexOf('m:') === 0) {
+                out.models[k.slice(2)] = v;
+            }
+        });
+        r.headersOut['Content-Type'] = 'application/json';
+        r.return(200, JSON.stringify(out) + '\n');
+    }
+
+    export default { route, modelId, idFromHeader, pickUpstream, refresh, update, dumpTable,
+                     choose, makeContext, SCORERS, FILTERS, DEFAULT_POLICY };
+  routing-agent.py: |
+    import argparse
+    import concurrent.futures
+    import json
+    import os
+    import re
+    import socket
+    import ssl
+    import struct
+    import threading
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+    RQTIME_SUM_RE = re.compile(r'^envoy_cluster_upstream_rq_time_sum\{[^}]*cluster_name="inbound\|8080\|\|[^"]*"[^}]*\}\s+([0-9.eE+-]+)', re.M)
+    RQTIME_CNT_RE = re.compile(r'^envoy_cluster_upstream_rq_time_count\{[^}]*cluster_name="inbound\|8080\|\|[^"]*"[^}]*\}\s+([0-9.eE+-]+)', re.M)
+    ACTIVE_RE = re.compile(r'^envoy_cluster_upstream_rq_active\{[^}]*cluster_name="inbound\|8080\|\|[^"]*"[^}]*\}\s+([0-9.eE+-]+)', re.M)
+
+    def log(*a):
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+    def collect_envoy_queue(pod, http_get):
+        body = http_get(pod["metrics"])
+        m = ACTIVE_RE.search(body)
+        out = {"active": int(float(m.group(1))) if m else 0}
+        sm, cm = RQTIME_SUM_RE.search(body), RQTIME_CNT_RE.search(body)
+        if sm and cm:
+            out["_sum_ms"], out["_cnt"] = float(sm.group(1)), float(cm.group(1))
+        return out
+
+    COLLECTORS = {
+        "envoy_queue": collect_envoy_queue,
+    }
+
+    class K8s:
+
+        def __init__(self):
+            host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+            port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+            self.base = f"https://{host}:{port}"
+            self.ctx = ssl.create_default_context(cafile=f"{SA_DIR}/ca.crt")
+
+            self.calls, self.bytes = 0, 0
+
+        def _req(self, path, params):
+            token = open(f"{SA_DIR}/token").read().strip()
+            url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
+            return urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+
+        def get(self, path, **params):
+            with urllib.request.urlopen(self._req(path, params), timeout=5, context=self.ctx) as r:
+                raw = r.read()
+            self.calls += 1
+            self.bytes += len(raw)
+            return json.loads(raw)
+
+        def watch(self, path, timeout_s=300, **params):
+            params = dict(params, watch="1", timeoutSeconds=str(timeout_s), allowWatchBookmarks="true")
+            with urllib.request.urlopen(self._req(path, params), timeout=timeout_s + 30, context=self.ctx) as r:
+                self.calls += 1
+                for line in r:
+                    self.bytes += len(line)
+                    if line.strip():
+                        yield json.loads(line)
+
+    def pod_entry(p, zones, a):
+        st, spec, meta = p.get("status", {}), p["spec"], p["metadata"]
+        ip = st.get("podIP")
+        if not ip or st.get("phase") != "Running" or meta.get("deletionTimestamp"):
+            return None
+        ready = any(c["type"] == "Ready" and c["status"] == "True" for c in st.get("conditions", []))
+        slots = 1
+        for c in spec.get("containers", []):
+            for e in c.get("env", []) or []:
+                if e.get("name") == "LLAMACPP_PARALLEL" and str(e.get("value", "")).isdigit():
+                    slots = int(e["value"])
+        node = spec.get("nodeName", "")
+        return {"pod": meta["name"], "addr": f"{ip}:{a.app_port}", "node": node, "zone": zones.get(node, ""),
+                "model": meta.get("labels", {}).get("group", ""), "ready": ready, "slots": slots}
+
+    def metrics_url(addr, a):
+        f = "inbound.8080.*upstream_rq_(active|time)" if getattr(a, "load", False) else "upstream_rq_active"
+        return f"http://{addr.split(':')[0]}:{a.metrics_port}/stats/prometheus?filter=" + urllib.parse.quote(f)
+
+    class LoadTracker:
+
+        def __init__(self, window):
+            self.window = window
+            self.snaps = {}
+            self.last_r = {}
+
+        def update(self, pod, t, sig):
+            if "_cnt" not in sig:
+                return {}
+            sn = self.snaps.setdefault(pod, [])
+            if sn and sig["_cnt"] < sn[-1][1]:
+                sn.clear()
+            sn.append((t, sig["_cnt"], sig["_sum_ms"]))
+            while len(sn) > 2 and sn[1][0] <= t - self.window:
+                sn.pop(0)
+            t0, c0, s0 = sn[0]
+            if len(sn) < 2 or t - t0 <= 0:
+                return {}
+            dc = sig["_cnt"] - c0
+            x = dc / (t - t0)
+            if dc > 0:
+                self.last_r[pod] = (sig["_sum_ms"] - s0) / dc / 1000.0
+            r = self.last_r.get(pod)
+            if r is None:
+                return {}
+            l = x * r if dc > 0 else float(sig.get("active", 0))
+            return {"r": round(r, 4), "l": round(l, 3), "x": round(x, 3)}
+
+        def forget(self, keep):
+            for p in list(self.snaps):
+                if p not in keep:
+                    self.snaps.pop(p, None)
+                    self.last_r.pop(p, None)
+
+    class K8sDiscovery:
+        def __init__(self, a):
+            self.a = a
+            self.k8s = K8s()
+            self.zones, self.zones_at = {}, 0
+
+        def node_zones(self):
+            if time.time() - self.zones_at > 60:
+                nodes = self.k8s.get("/api/v1/nodes")["items"]
+                self.zones = {n["metadata"]["name"]: n["metadata"].get("labels", {}).get(self.a.zone_label, "")
+                              for n in nodes}
+                self.zones_at = time.time()
+            return self.zones
+
+        def pods(self):
+            params = {"labelSelector": self.a.model_selector}
+            if self.a.mode == "node":
+                params["fieldSelector"] = f"spec.nodeName={self.a.node}"
+            items = self.k8s.get(f"/api/v1/namespaces/{self.a.namespace}/pods", **params)["items"]
+            zones = self.node_zones()
+            out = []
+            for p in items:
+                e = pod_entry(p, zones, self.a)
+                if e:
+                    out.append(dict(e, metrics=metrics_url(e["addr"], self.a)))
+            return out
+
+        def peers(self):
+            items = self.k8s.get(f"/api/v1/namespaces/{self.a.namespace}/pods",
+                                 labelSelector=self.a.peer_selector)["items"]
+            best = {}
+            for p in items:
+                st, meta = p.get("status", {}), p["metadata"]
+                ip, node = st.get("podIP"), p["spec"].get("nodeName", "")
+                if not ip or st.get("phase") != "Running" or meta.get("deletionTimestamp") or node == self.a.node:
+                    continue
+                if node not in best or meta["creationTimestamp"] > best[node][0]:
+                    best[node] = (meta["creationTimestamp"], ip)
+            return [{"node": n, "url": f"http://{ip}:{self.a.port}"} for n, (_, ip) in best.items()]
+
+    def newest_per_node(items, exclude_node=None):
+        best = {}
+        for p in items:
+            st, meta = p.get("status", {}), p["metadata"]
+            ip, node = st.get("podIP"), p["spec"].get("nodeName", "")
+            if not ip or st.get("phase") != "Running" or meta.get("deletionTimestamp") or node == exclude_node:
+                continue
+            if node not in best or meta["creationTimestamp"] > best[node][0]:
+                best[node] = (meta["creationTimestamp"], ip)
+        return {n: ip for n, (_, ip) in best.items()}
+
+    def _k8s_routers(self):
+        items = self.k8s.get(f"/api/v1/namespaces/{self.a.namespace}/pods", labelSelector=self.a.peer_selector)["items"]
+        return [{"node": n, "url": f"http://{ip}:{self.a.router_port}"} for n, ip in newest_per_node(items).items()]
+
+    K8sDiscovery.routers = _k8s_routers
+
+    class StaticDiscovery:
+
+        def __init__(self, a):
+            self.a = a
+
+        def _load(self):
+            with open(self.a.static_file) as f:
+                return json.load(f)
+
+        def node_zones(self):
+            return self._load().get("nodes", {})
+
+        def pods(self):
+            d = self._load()
+            pods = [dict(p, zone=p.get("zone") or d.get("nodes", {}).get(p["node"], "")) for p in d["pods"]]
+            if self.a.mode == "node":
+                pods = [p for p in pods if p["node"] == self.a.node]
+            return pods
+
+        def peers(self):
+            return [p for p in self._load().get("peers", []) if p["node"] != self.a.node]
+
+        def routers(self):
+            return self._load().get("routers", [])
+
+    HDR = 250
+
+    def ekey(e):
+        return json.dumps([e.get("ready"), e.get("slots"), e.get("signals")], sort_keys=True)
+
+    class State:
+        def __init__(self, a, disc):
+            self.a = a
+            self.disc = disc
+            self.lock = threading.Lock()
+            self.cond = threading.Condition(self.lock)
+            self.routers = []
+            self.local = {}
+            self.remote = {}
+            self.rtt = {}
+            self.nodes = {}
+            self.peers = []
+            self.pod_list = []
+            self.policy = {}
+            self.policy_mtime = 0
+            self.need_pull = set()
+            self.endpoints = {}
+            self.links = {}
+            self.net_ts = 0.0
+            self.mqtt = None
+            self.tracker = LoadTracker(a.load_window)
+            self.load_sent, self.load_sent_at = {}, 0.0
+            self.loads = {}
+            self.status = {}
+            self.changed_ev = threading.Event()
+            self.version = int(time.time() * 1000)
+            self.model_ver = {}
+            self.meta_key, self.meta_ver = "", self.version
+            self.models_present = set()
+            self.counters = {"polls": 0, "poll_errors": 0, "poll_bytes": 0, "polls_xzone": 0, "poll_bytes_xzone": 0,
+                             "ex_out": 0, "bytes_out": 0, "ex_out_xzone": 0, "bytes_out_xzone": 0,
+                             "push_msgs": 0, "pings": 0, "pulls": 0, "push_errors": 0,
+                             "recv_msgs": 0, "recv_bytes": 0, "table_reads": 0, "table_bytes": 0,
+                             "table_unchanged": 0, "chg_delay_sum": 0.0, "chg_delay_n": 0}
+            self.started = time.time()
+
+        def self_zone(self):
+            return self.nodes.get(self.a.node, "") if self.a.node else ""
+
+        def count(self, k, n=1):
+            with self.lock:
+                self.counters[k] += n
+
+        def count_exchange(self, peer_node, nbytes, kind):
+            with self.lock:
+                self.counters["ex_out"] += 1
+                self.counters["bytes_out"] += nbytes
+                self.counters[kind] += 1
+                if self.nodes.get(peer_node, "") != self.self_zone():
+                    self.counters["ex_out_xzone"] += 1
+                    self.counters["bytes_out_xzone"] += nbytes
+
+        def bump(self, models):
+            self.version += 1
+            for m in models:
+                self.model_ver[m] = self.version
+            self.cond.notify_all()
+
+        def load_policy(self):
+            try:
+                mt = os.path.getmtime(self.a.policy_file)
+                if mt != self.policy_mtime:
+                    with open(self.a.policy_file) as f:
+                        self.policy = json.load(f)
+                    self.policy_mtime = mt
+                    log("policy caricata", self.a.policy_file)
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError) as e:
+                log("policy non valida:", e)
+
+        def table(self, since=None):
+            stale = float(self.policy.get("staleS", 5))
+            with self.lock:
+                now = time.time()
+                for src, r in list(self.remote.items()):
+                    if now - r["received"] > stale * 2:
+                        self.bump({e["model"] for e in r["entries"].values()})
+                        del self.remote[src]
+                links = {}
+                if self.a.mode == "broker" and now - self.net_ts <= self.a.net_stale:
+                    links = self.links
+                rtt = {k: v["rtt"] for k, v in links.items() if v.get("rtt") is not None} if self.a.mode == "broker" \
+                    else {k: round(v, 4) for k, v in self.rtt.items()}
+                meta = {"policy": self.policy, "nodes": self.nodes, "rtt": rtt}
+                if self.a.mode == "broker":
+                    meta["links"] = links
+                mk = json.dumps(meta, sort_keys=True)
+                if mk != self.meta_key:
+                    self.meta_key, self.version = mk, self.version + 1
+                    self.meta_ver = self.version
+                entries = {k: dict(e, mts=e["ts"]) for k, e in self.local.items()}
+                for r in self.remote.values():
+                    for k, e in r["entries"].items():
+                        entries[k] = dict(e, ts=max(e["ts"], r.get("last_sent", 0)), mts=e["ts"])
+                if self.a.mode == "broker":
+                    m = self.mqtt
+                    ok = bool(m and (m.connected or now - m.down_since <= self.a.broker_grace))
+                    if ok != getattr(self, "remote_ok", None):
+                        self.remote_ok = ok
+                        self.bump(set(self.endpoints))
+                    if ok:
+                        for pods in self.endpoints.values():
+                            for e in pods:
+                                if e["node"] != self.a.node or self.a.prom_load:
+                                    ld = self.loads.get(e["node"])
+                                    sig = None
+                                    alive = self.status.get("global" if ld and ld.get("src") == "global" else e["node"], True)
+                                    fresh = self.a.load_stale <= 0 or now - ld["ts"] <= self.a.load_stale if ld else False
+                                    if (self.a.load or self.a.prom_load) and ld and alive and fresh:
+                                        sig = ld["pods"].get(e["pod"])
+                                    if sig:
+                                        entries[e["pod"]] = dict(e, signals={k: sig[k] for k in ("r", "l", "x")},
+                                                                 ts=sig["ts"], mts=sig["ts"], remote=True)
+                                    else:
+                                        entries[e["pod"]] = dict(e, signals={}, ts=now, mts=now, remote=True)
+                models = {}
+                for e in entries.values():
+                    models.setdefault(e["model"], []).append(e)
+                for m in set(models) - self.models_present:
+                    self.model_ver.setdefault(m, self.version)
+                self.models_present = set(models)
+                self.counters["table_reads"] += 1
+                counters = dict(self.counters)
+                if self.mqtt:
+                    counters.update(self.mqtt.counters)
+                    counters["mqtt_connected"] = int(self.mqtt.connected)
+                agent = {"mode": self.a.mode, "opt": self.a.opt, "node": self.a.node, "zone": self.self_zone(),
+                         "counters": counters, "cpu_s": round(time.process_time(), 3),
+                         "uptime_s": round(now - self.started, 1)}
+                out = {"version": self.version, "generated": now}
+                if self.a.opt and since is not None and since >= self.version:
+                    self.counters["table_unchanged"] += 1
+                    return dict(out, unchanged=True)
+                if self.a.opt and since is not None and since > 0:
+                    out.update(partial=True, models_present=sorted(models),
+                               models={m: v for m, v in models.items() if self.model_ver.get(m, 0) > since})
+                    if self.meta_ver > since:
+                        out.update(meta)
+                    return out
+                out.update(meta, agent=agent, models=models)
+                return out
+
+    def http_get_factory(state, pod=None):
+        def http_get(url):
+            with urllib.request.urlopen(url, timeout=state.a.poll_timeout) as r:
+                body = r.read()
+            xz = pod is not None and pod.get("zone", "") != state.self_zone()
+            with state.lock:
+                state.counters["poll_bytes"] += len(body)
+                if xz:
+                    state.counters["polls_xzone"] += 1
+                    state.counters["poll_bytes_xzone"] += len(body)
+            return body.decode(errors="replace")
+        return http_get
+
+    def discovery_loop(state):
+        while True:
+            try:
+                pods = state.disc.pods()
+                nodes = state.disc.node_zones()
+                peers = state.disc.peers() if state.a.mode == "node" else []
+                routers = state.disc.routers() if (state.a.mode == "central" and state.a.opt) else []
+                with state.lock:
+                    state.nodes = nodes
+                    state.peers = peers
+                    state.routers = routers
+                    state.pod_list = pods
+                    gone = set(state.local) - {p["pod"] for p in pods}
+                    if gone:
+                        state.bump({state.local[g]["model"] for g in gone})
+                    for g in gone:
+                        del state.local[g]
+                state.load_policy()
+            except Exception as e:
+                log("scoperta fallita:", type(e).__name__, e)
+            time.sleep(state.a.discovery_interval)
+
+    def poll_loop(state):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+        def one(p):
+            signals = {}
+            hg = http_get_factory(state, p)
+            for name, fn in COLLECTORS.items():
+                try:
+                    signals.update(fn(p, hg))
+                except Exception as e:
+                    state.count("poll_errors")
+                    signals["error"] = f"{name}: {type(e).__name__}"
+            state.count("polls")
+            t = time.time()
+            if state.a.load and "error" not in signals:
+                signals = state.tracker.update(p["pod"], t, signals)
+            else:
+                signals = {k: v for k, v in signals.items() if not k.startswith("_")}
+            return dict(p, signals=signals, ts=t, source=state.a.node or "central")
+
+        while True:
+            t0 = time.time()
+            pods = list(state.pod_list)
+            results = list(pool.map(one, pods)) if pods else []
+            with state.lock:
+                changed = set()
+                for e in results:
+                    old = state.local.get(e["pod"])
+                    if old is None or ekey(old) != ekey(e):
+                        changed.add(e["model"])
+                    state.local[e["pod"]] = e
+                if changed:
+                    state.bump(changed)
+            if changed:
+                state.changed_ev.set()
+            if state.a.load:
+                state.tracker.forget({p["pod"] for p in pods})
+                publish_load(state)
+            time.sleep(max(0.0, state.a.interval - (time.time() - t0)))
+
+    def publish_load(state):
+        a, m = state.a, state.mqtt
+        if not m or not m.connected:
+            return
+        with state.lock:
+            cur = {k: dict(e["signals"], ts=round(e["ts"], 3)) for k, e in state.local.items() if e.get("signals", {}).get("r") is not None}
+        prev = state.load_sent
+        now = time.time()
+
+        def moved(o, n):
+            if o is None:
+                return True
+            if abs(n["r"] - o["r"]) > max(a.load_th_r, a.load_th_rel * o["r"]):
+                return True
+            return abs(n["l"] - o["l"]) > max(a.load_th_l, a.load_th_rel * o["l"])
+
+        change = set(cur) != set(prev) or any(moved(prev.get(k), v) for k, v in cur.items())
+        if not change and (a.load_confirm <= 0 or now - state.load_sent_at < a.load_confirm) and state.load_sent_at > 0:
+            return
+        if m.publish(T_LOAD + a.node, {"ts": now, "pods": cur}):
+            with state.lock:
+                state.counters["load_pubs" if change else "load_confirms"] = \
+                    state.counters.get("load_pubs" if change else "load_confirms", 0) + 1
+            state.load_sent, state.load_sent_at = cur, now
+
+    def push_loop(state):
+        last_sent = {}
+        last_hb = 0.0
+        known_peers = set()
+        busy = set()
+        busy_lock = threading.Lock()
+        samples = {}
+
+        def rtt_sample(node, dt):
+            s = samples.setdefault(node, [])
+            s.append(dt)
+            del s[:-10]
+            with state.lock:
+                state.rtt[node] = min(s)
+
+        def send(peer, msg):
+            data = json.dumps(msg, separators=(",", ":")).encode()
+            req = urllib.request.Request(peer["url"] + "/update", data=data,
+                                         headers={"Content-Type": "application/json"})
+            t0 = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=1.0) as r:
+                    resp = r.read()
+                if state.a.opt:
+                    rtt_sample(peer["node"], time.time() - t0)
+                state.count_exchange(peer["node"], len(data) + len(resp), "push_msgs")
+            except Exception:
+                state.count("push_errors")
+            finally:
+                with busy_lock:
+                    busy.discard(peer["url"])
+
+        def pull(peer):
+            try:
+                with urllib.request.urlopen(peer["url"] + "/local", timeout=1.0) as r:
+                    raw = r.read()
+                state.count_exchange(peer["node"], len(raw), "pulls")
+                apply_update(state, json.loads(raw), len(raw))
+            except Exception:
+                state.count("push_errors")
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+        pending = False
+        while True:
+            if state.a.opt:
+                state.changed_ev.wait(timeout=state.a.interval if pending else state.a.interval * 4)
+                state.changed_ev.clear()
+            else:
+                time.sleep(state.a.interval)
+            now = time.time()
+            with state.lock:
+                local = dict(state.local)
+                peers = list(state.peers)
+                want = set(state.need_pull)
+                state.need_pull.clear()
+            hb = now - last_hb >= state.a.heartbeat
+            new_peers = [p for p in peers if p["url"] not in known_peers]
+            known_peers = {p["url"] for p in peers}
+            for u in set(last_sent) - known_peers:
+                del last_sent[u]
+            pending = False
+            for peer in peers:
+                if peer in new_peers or peer["node"] in want:
+                    pool.submit(pull, peer)
+            for peer in peers:
+                sent = last_sent.setdefault(peer["url"], {})
+                changed = [e for p, e in local.items() if sent.get(p) != ekey(e)]
+                is_new = peer in new_peers
+                if state.a.opt:
+                    if is_new:
+                        msg = {"from": state.a.node, "sent": now, "full": True, "entries": list(local.values())}
+                    elif changed:
+                        msg = {"from": state.a.node, "sent": now, "t": "chg",
+                               "e": [{"pod": e["pod"], "s": e["signals"], "r": e["ready"], "n": e["slots"],
+                                      "ts": e["ts"]} for e in changed]}
+                    elif hb:
+                        msg = {"from": state.a.node, "sent": now, "t": "hb", "pods": sorted(local)}
+                    else:
+                        continue
+                else:
+                    if not (changed or hb or is_new):
+                        continue
+                    full = hb or is_new
+                    msg = {"from": state.a.node, "sent": now, "full": full,
+                           "entries": list(local.values()) if full else changed}
+                with busy_lock:
+                    if peer["url"] in busy:
+                        pending = pending or bool(changed)
+                        continue
+                    busy.add(peer["url"])
+                pool.submit(send, peer, msg)
+                for e in (local.values() if (is_new or msg.get("full")) else changed):
+                    sent[e["pod"]] = ekey(e)
+                for p in set(sent) - set(local):
+                    del sent[p]
+            if hb:
+                last_hb = now
+
+    def router_push_loop(state):
+        delivered = {}
+        last_push = {}
+        busy = set()
+        busy_lock = threading.Lock()
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
+        def push(router, body, version):
+            data = json.dumps(body, separators=(",", ":")).encode()
+            req = urllib.request.Request(router["url"] + "/routing-update", data=data,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=1.0) as r:
+                    r.read()
+                with state.lock:
+                    state.counters["table_bytes"] += len(data)
+                    state.counters["table_pushes"] = state.counters.get("table_pushes", 0) + 1
+                delivered[router["url"]] = version
+            except Exception:
+                state.count("push_errors")
+                delivered.pop(router["url"], None)
+            finally:
+                with busy_lock:
+                    busy.discard(router["url"])
+
+        while True:
+            with state.lock:
+                state.cond.wait(timeout=0.2)
+                routers = list(state.routers)
+                version = state.version
+            now = time.time()
+            for u in set(delivered) - {r["url"] for r in routers}:
+                delivered.pop(u, None)
+            for router in routers:
+                have = delivered.get(router["url"])
+                if have is not None and have >= version and now - last_push.get(router["url"], 0) < state.a.keepalive:
+                    continue
+                with busy_lock:
+                    if router["url"] in busy:
+                        continue
+                    busy.add(router["url"])
+                body = state.table(since=have)
+                last_push[router["url"]] = now
+                pool.submit(push, router, body, body["version"])
+
+    def ping_loop(state):
+        samples = {}
+        while True:
+            with state.lock:
+                peers = list(state.peers)
+            for peer in peers:
+                t0 = time.time()
+                try:
+                    with urllib.request.urlopen(peer["url"] + "/healthz", timeout=1.0) as r:
+                        body = r.read()
+                except Exception:
+                    continue
+                state.count_exchange(peer["node"], len(body), "pings")
+                s = samples.setdefault(peer["node"], [])
+                s.append(time.time() - t0)
+                del s[:-10]
+                with state.lock:
+                    state.rtt[peer["node"]] = min(s)
+            time.sleep(state.a.ping_interval)
+
+    def apply_update(state, msg, size):
+        now = time.time()
+        src = msg.get("from", "?")
+        with state.lock:
+            state.counters["recv_msgs"] += 1
+            state.counters["recv_bytes"] += size
+            r = state.remote.setdefault(src, {"received": 0, "last_sent": 0, "entries": {}})
+            touched = set()
+            if msg.get("full") or "entries" in msg:
+                if msg.get("full"):
+                    touched |= {e["model"] for e in r["entries"].values()}
+                    r["entries"] = {}
+                for e in msg.get("entries", []):
+                    old = r["entries"].get(e["pod"])
+                    if not msg.get("full") and old is not None and ekey(old) != ekey(e):
+                        state.counters["chg_delay_sum"] += max(0.0, now - e["ts"])
+                        state.counters["chg_delay_n"] += 1
+                    r["entries"][e["pod"]] = e
+                    touched.add(e["model"])
+            elif msg.get("t") == "chg":
+                for c in msg.get("e", []):
+                    base = r["entries"].get(c["pod"])
+                    if base is None:
+                        state.need_pull.add(src)
+                        continue
+                    r["entries"][c["pod"]] = dict(base, signals=c["s"], ready=c["r"], slots=c["n"], ts=c["ts"])
+                    state.counters["chg_delay_sum"] += max(0.0, now - c["ts"])
+                    state.counters["chg_delay_n"] += 1
+                    touched.add(base["model"])
+            elif msg.get("t") == "hb":
+                pods = set(msg.get("pods", []))
+                for p in list(r["entries"]):
+                    if p not in pods:
+                        touched.add(r["entries"][p]["model"])
+                        del r["entries"][p]
+                if pods - set(r["entries"]):
+                    state.need_pull.add(src)
+            r["received"] = now
+            r["last_sent"] = float(msg.get("sent", 0))
+            if touched:
+                state.bump(touched)
+
+    class Mqtt:
+
+        def __init__(self, host, port, client_id, keepalive=30, will=None, on_connect=None, on_message=None):
+            self.host, self.port, self.client_id, self.keepalive = host, port, client_id, keepalive
+            self.will, self.on_connect, self.on_message = will, on_connect, on_message
+            self.sock = None
+            self.lock = threading.Lock()
+            self.connected = False
+            self.down_since = time.time()
+            self.last_rx = self.last_tx = 0.0
+            self.pid = 0
+            self.counters = {"mqtt_pkts_out": 0, "mqtt_bytes_out": 0, "mqtt_pkts_in": 0, "mqtt_bytes_in": 0,
+                             "mqtt_pub_out": 0, "mqtt_pub_in": 0, "mqtt_connects": 0}
+
+        @staticmethod
+        def _varlen(n):
+            out = bytearray()
+            while True:
+                b, n = n % 128, n // 128
+                out.append(b | (0x80 if n else 0))
+                if not n:
+                    return bytes(out)
+
+        @staticmethod
+        def _str(s):
+            b = s.encode() if isinstance(s, str) else s
+            return struct.pack("!H", len(b)) + b
+
+        def _send(self, first, body):
+            pkt = bytes([first]) + self._varlen(len(body)) + body
+            with self.lock:
+                if not self.sock:
+                    raise OSError("non connesso")
+                self.sock.sendall(pkt)
+                self.last_tx = time.time()
+                self.counters["mqtt_pkts_out"] += 1
+                self.counters["mqtt_bytes_out"] += len(pkt)
+
+        def publish(self, topic, payload, retain=True):
+            if not isinstance(payload, (bytes, str)):
+                payload = json.dumps(payload, separators=(",", ":"))
+            if isinstance(payload, str):
+                payload = payload.encode()
+            try:
+                self._send(0x30 | (1 if retain else 0), self._str(topic) + payload)
+                self.counters["mqtt_pub_out"] += 1
+                return True
+            except OSError:
+                return False
+
+        def subscribe(self, topics):
+            self.pid = self.pid % 65535 + 1
+            body = struct.pack("!H", self.pid) + b"".join(self._str(t) + b"\x00" for t in topics)
+            self._send(0x82, body)
+
+        def _recv_exact(self, s, n):
+            buf = b""
+            while len(buf) < n:
+                try:
+                    chunk = s.recv(n - len(buf))
+                except socket.timeout:
+                    now = time.time()
+                    if now - self.last_rx > self.keepalive * 1.5:
+                        raise OSError("broker muto")
+                    if now - self.last_tx > self.keepalive / 2:
+                        self._send(0xC0, b"")
+                    continue
+                if not chunk:
+                    raise OSError("connessione chiusa dal broker")
+                buf += chunk
+            self.last_rx = time.time()
+            return buf
+
+        def _read_packet(self, s):
+            h = self._recv_exact(s, 1)[0]
+            n, mult, nlen = 0, 1, 0
+            while True:
+                b = self._recv_exact(s, 1)[0]
+                nlen += 1
+                n += (b & 0x7F) * mult
+                mult *= 128
+                if not b & 0x80:
+                    break
+            body = self._recv_exact(s, n) if n else b""
+            self.counters["mqtt_pkts_in"] += 1
+            self.counters["mqtt_bytes_in"] += 1 + nlen + n
+            return h, body
+
+        def start(self):
+            threading.Thread(target=self._run, daemon=True).start()
+            return self
+
+        def _run(self):
+            backoff = 0.5
+            while True:
+                s = None
+                try:
+                    s = socket.create_connection((self.host, self.port), timeout=5)
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    s.settimeout(1.0)
+                    flags, payload = 0x02, self._str(self.client_id)
+                    if self.will:
+                        topic, msg, retain = self.will
+                        flags |= 0x04 | (0x20 if retain else 0)
+                        payload += self._str(topic) + self._str(msg)
+                    with self.lock:
+                        self.sock = s
+                    self.last_rx = time.time()
+                    self._send(0x10, self._str("MQTT") + bytes([4, flags]) + struct.pack("!H", self.keepalive) + payload)
+                    h, b = self._read_packet(s)
+                    if h >> 4 != 2 or len(b) < 2 or b[1] != 0:
+                        raise OSError(f"CONNACK rifiutato: {b!r}")
+                    self.connected = True
+                    self.counters["mqtt_connects"] += 1
+                    backoff = 0.5
+                    log(f"MQTT connesso a {self.host}:{self.port} come {self.client_id}")
+                    if self.on_connect:
+                        self.on_connect(self)
+                    while True:
+                        h, b = self._read_packet(s)
+                        if h >> 4 == 3:
+                            tl = struct.unpack("!H", b[:2])[0]
+                            off = 2 + tl + (2 if (h >> 1) & 3 else 0)
+                            self.counters["mqtt_pub_in"] += 1
+                            try:
+                                self.on_message(b[2:2 + tl].decode(), b[off:])
+                            except Exception as e:
+                                log("messaggio MQTT non valido:", b[2:2 + tl], type(e).__name__, e)
+                except Exception as e:
+                    if self.connected:
+                        log("MQTT disconnesso:", type(e).__name__, e)
+                        self.down_since = time.time()
+                    self.connected = False
+                    with self.lock:
+                        self.sock = None
+                    if s:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 5.0)
+
+    T_ENDPOINTS = "routing/endpoints/"
+    T_NETWORK = "routing/network/"
+    T_NODES = "routing/nodes"
+    T_LOAD = "routing/load/"
+    T_STATUS = "routing/status/"
+
+    PROM_QUERIES = {
+        "rtt": "avg by (origin_node, destination_node) (rate(node_latency_sum[{w}]) / rate(node_latency_count[{w}]))",
+        "loss": "avg by (origin_node, destination_node) (avg_over_time(node_packet_loss_ratio[{w}]))",
+        "bw": "avg by (origin_node, destination_node) (last_over_time(node_bandwidth_bytes_per_second[{bw}]))",
+    }
+
+    class GlobalAgent:
+
+        def __init__(self, a, disc):
+            self.a, self.disc = a, disc
+            self.lock = threading.Lock()
+            self.local = {}
+            self.raw = {}
+            self.zones = {}
+            self.endpoints = {}
+            self.sent_ep = {}
+            self.net = {}
+            self.sent_net = {}
+            self.sent_zones = None
+            self.counters = {"k8s_events": 0, "prom_queries": 0, "prom_bytes": 0, "prom_errors": 0,
+                             "ep_pubs": 0, "net_pubs": 0, "net_confirms": 0}
+            self.started = time.time()
+            self.mqtt = Mqtt(a.mqtt_host, a.mqtt_port, "routing-global", a.mqtt_keepalive,
+                             will=(T_STATUS + "global", json.dumps({"online": False}), True),
+                             on_connect=self.on_connect, on_message=lambda t, p: None)
+
+        def count(self, k, n=1):
+            with self.lock:
+                self.counters[k] = self.counters.get(k, 0) + n
+
+        def on_connect(self, m):
+            m.publish(T_STATUS + "global", {"online": True, "ts": time.time()})
+            with self.lock:
+                self.sent_ep, self.sent_net, self.sent_zones = {}, {}, None
+            self.publish_zones()
+            self.publish_endpoints()
+            self.publish_network(force=True)
+
+        def entry(self, p):
+            if "metadata" not in p:
+                return dict(p, zone=p.get("zone") or self.zones.get(p["node"], ""))
+            return pod_entry(p, self.zones, self.a)
+
+        def publish_endpoints(self):
+            with self.lock:
+                models = {m: [] for m in self.sent_ep}
+                for p in self.raw.values():
+                    e = self.entry(p)
+                    if e:
+                        e = {k: e[k] for k in ("pod", "addr", "node", "zone", "model", "ready", "slots", "metrics") if k in e}
+                        models.setdefault(e["model"], []).append(e)
+                out = []
+                for m, pods in models.items():
+                    pods.sort(key=lambda e: e["pod"])
+                    key = json.dumps(pods, sort_keys=True)
+                    if self.sent_ep.get(m) != key:
+                        out.append((m, pods, key))
+                self.endpoints = models
+            for m, pods, key in out:
+                if self.mqtt.publish(T_ENDPOINTS + m, {"ts": time.time(), "pods": pods}):
+                    with self.lock:
+                        self.sent_ep[m] = key
+                        self.counters["ep_pubs"] += 1
+                    log(f"endpoint {m}: {len(pods)} pod ({sum(1 for e in pods if e['ready'])} pronti)")
+
+        def publish_zones(self):
+            with self.lock:
+                z = dict(self.zones)
+                if z == self.sent_zones:
+                    return
+            if self.mqtt.publish(T_NODES, {"ts": time.time(), "zones": z}):
+                with self.lock:
+                    self.sent_zones = z
+
+        def watch_loop(self):
+            if isinstance(self.disc, StaticDiscovery):
+                while True:
+                    try:
+                        with self.lock:
+                            self.raw = {p["pod"]: p for p in self.disc.pods()}
+                        self.publish_endpoints()
+                    except Exception as e:
+                        log("endpoint (file) non letti:", e)
+                    time.sleep(1)
+            k8s, path = self.disc.k8s, f"/api/v1/namespaces/{self.a.namespace}/pods"
+            while True:
+                try:
+                    lst = k8s.get(path, labelSelector=self.a.model_selector)
+                    rv = lst["metadata"]["resourceVersion"]
+                    with self.lock:
+                        self.raw = {p["metadata"]["name"]: p for p in lst["items"]}
+                    self.publish_endpoints()
+                    while True:
+                        for ev in k8s.watch(path, labelSelector=self.a.model_selector, resourceVersion=rv):
+                            t, obj = ev.get("type"), ev.get("object", {})
+                            if t == "ERROR":
+                                raise RuntimeError(obj.get("message", "watch error"))
+                            rv = obj["metadata"]["resourceVersion"]
+                            if t == "BOOKMARK":
+                                continue
+                            self.count("k8s_events")
+                            with self.lock:
+                                if t == "DELETED":
+                                    self.raw.pop(obj["metadata"]["name"], None)
+                                else:
+                                    self.raw[obj["metadata"]["name"]] = obj
+                            self.publish_endpoints()
+                except Exception as e:
+                    log("watch dei pod interrotta, rileggo la lista:", type(e).__name__, e)
+                    time.sleep(2)
+
+        def zones_loop(self):
+            while True:
+                try:
+                    z = self.disc.node_zones()
+                    with self.lock:
+                        changed, self.zones = z != self.zones, z
+                    if changed:
+                        self.publish_zones()
+                        self.publish_endpoints()
+                except Exception as e:
+                    log("zone dei nodi non lette:", type(e).__name__, e)
+                time.sleep(60)
+
+        def prom_query(self, q):
+            url = self.a.prometheus_url.rstrip("/") + "/api/v1/query?" + urllib.parse.urlencode({"query": q})
+            with urllib.request.urlopen(url, timeout=5) as r:
+                raw = r.read()
+            self.count("prom_queries")
+            self.count("prom_bytes", len(raw))
+            d = json.loads(raw)
+            if d.get("status") != "success":
+                raise RuntimeError(d.get("error", "query fallita"))
+            return d["data"]["result"]
+
+        def discover_prometheus(self):
+            k = getattr(self.disc, "k8s", None)
+            if not k:
+                return ""
+            cands = []
+            for s in k.get("/api/v1/services")["items"]:
+                name, ns = s["metadata"]["name"], s["metadata"]["namespace"]
+                if "prometheus" not in name or "operator" in name or "exporter" in name or "grafana" in name:
+                    continue
+                for p in s["spec"].get("ports", []):
+                    if p.get("port") == 9090 or p.get("name") in ("web", "http-web"):
+                        rank = (0 if name.endswith("-prometheus") else 1) + (0 if s["spec"].get("clusterIP") != "None" else 2)
+                        cands.append((rank, f"http://{name}.{ns}.svc:{p['port']}"))
+            for _, url in sorted(cands):
+                try:
+                    q = urllib.parse.urlencode({"query": "count(node_latency_count)"})
+                    with urllib.request.urlopen(f"{url}/api/v1/query?{q}", timeout=5) as r:
+                        res = json.load(r)["data"]["result"]
+                    if res and float(res[0]["value"][1]) > 0:
+                        log("Prometheus trovato:", url, "- serie di Mentat:", res[0]["value"][1])
+                        return url
+                    log("Prometheus senza metriche di Mentat, scartato:", url)
+                except Exception as e:
+                    log("Prometheus candidato non raggiungibile:", url, type(e).__name__, e)
+            return ""
+
+        def read_network(self, fields):
+            with self.lock:
+                net = {o: {d: dict(l) for d, l in ls.items()} for o, ls in self.net.items()}
+            for field in fields:
+                tmpl = PROM_QUERIES[field]
+                for ls in net.values():
+                    for l in ls.values():
+                        l.pop(field, None)
+                q = tmpl.replace("{w}", self.a.prom_window).replace("{bw}", self.a.prom_bw_window)
+                for s in self.prom_query(q):
+                    o, d = s["metric"].get("origin_node"), s["metric"].get("destination_node")
+                    try:
+                        v = float(s["value"][1])
+                    except (KeyError, ValueError, IndexError):
+                        continue
+                    if not o or not d or v != v:
+                        continue
+                    net.setdefault(o, {}).setdefault(d, {})[field] = v
+            return net
+
+        def differs(self, old, new):
+            if set(old) != set(new):
+                return True
+            a = self.a
+            for d, n in new.items():
+                o = old[d]
+                for f in ("rtt", "loss", "bw"):
+                    if (f in o) != (f in n):
+                        return True
+                if "rtt" in n and abs(n["rtt"] - o["rtt"]) > max(a.th_rtt_abs, a.th_rtt_rel * o["rtt"]):
+                    return True
+                if "loss" in n and abs(n["loss"] - o["loss"]) > a.th_loss:
+                    return True
+                if "bw" in n and abs(n["bw"] - o["bw"]) > a.th_bw_rel * max(o["bw"], 1.0):
+                    return True
+            return False
+
+        def publish_network(self, force=False):
+            now = time.time()
+            with self.lock:
+                net = {o: dict(ls) for o, ls in self.net.items()}
+            for origin, links in net.items():
+                links = {d: {k: (round(v, 5) if k != "bw" else round(v)) for k, v in l.items()} for d, l in links.items()}
+                ts, old = self.sent_net.get(origin, (0.0, None))
+                change = old is None or self.differs(old, links)
+                if not (force or change or now - ts >= self.a.net_refresh):
+                    continue
+                if self.mqtt.publish(T_NETWORK + origin, {"ts": now, "links": links if change or old is None else old}):
+                    self.sent_net[origin] = (now, links if change or old is None else old)
+                    self.count("net_pubs" if change else "net_confirms")
+                    if change:
+                        log(f"rete da {origin}: " + ", ".join(
+                            f"{d} rtt={l.get('rtt', 0) * 1000:.1f}ms loss={l.get('loss', 0):.2f}" for d, l in sorted(links.items())))
+
+        LOAD_SEL = '{reporter="destination",destination_workload=~"WL"}'
+        LOAD_QUERIES = {
+            "x": "sum by (pod) (rate(istio_requests_total" + LOAD_SEL + "[WIN]))",
+            "r": "sum by (pod) (rate(istio_request_duration_milliseconds_sum" + LOAD_SEL + "[WIN]))"
+                 " / sum by (pod) (rate(istio_request_duration_milliseconds_count" + LOAD_SEL + "[WIN]))",
+        }
+
+        def read_load(self):
+            out = {}
+            for f, tmpl in self.LOAD_QUERIES.items():
+                q = tmpl.replace("WL", self.a.load_workload_re).replace("WIN", self.a.load_window_prom)
+                for sres in self.prom_query(q):
+                    pod = sres["metric"].get("pod")
+                    try:
+                        v = float(sres["value"][1])
+                    except (KeyError, ValueError, IndexError):
+                        continue
+                    if not pod or v != v:
+                        continue
+                    out.setdefault(pod, {})[f] = v / 1000.0 if f == "r" else v
+            return out
+
+        def load_loop(self):
+            while self.a.prometheus_url in ("", "auto"):
+                time.sleep(5)
+            last_r, sent = {}, {}
+            a = self.a
+
+            def moved(o, n):
+                if o is None:
+                    return True
+                if abs(n["r"] - o["r"]) > max(a.load_th_r, a.load_th_rel * o["r"]):
+                    return True
+                return abs(n["l"] - o["l"]) > max(a.load_th_l, a.load_th_rel * o["l"])
+
+            while True:
+                t0 = time.time()
+                try:
+                    raw = self.read_load()
+                    with self.lock:
+                        where = {e["pod"]: e["node"] for ps in self.endpoints.values() for e in ps}
+                    per_node = {}
+                    for pod, node in where.items():
+                        v = raw.get(pod, {})
+                        if "r" in v:
+                            last_r[pod] = v["r"]
+                        if pod not in last_r:
+                            continue
+                        x = v.get("x", 0.0)
+                        r = last_r[pod]
+                        per_node.setdefault(node, {})[pod] = {"r": round(r, 4), "l": round(x * r, 3), "x": round(x, 3),
+                                                              "ts": round(t0, 3)}
+                    for node in set(per_node) | set(sent):
+                        cur, prev = per_node.get(node, {}), sent.get(node, {})
+                        if set(cur) == set(prev) and not any(moved(prev.get(k), v) for k, v in cur.items()):
+                            continue
+                        if self.mqtt.publish(T_LOAD + node, {"ts": t0, "src": "global", "pods": cur}):
+                            sent[node] = cur
+                            self.count("load_pubs")
+                except Exception as e:
+                    self.count("prom_errors")
+                    log("carico da Prometheus non letto:", type(e).__name__, e)
+                time.sleep(max(0.0, a.load_prom_interval - (time.time() - t0)))
+
+        def prom_loop(self):
+            while self.a.prometheus_url in ("", "auto"):
+                try:
+                    url = self.discover_prometheus()
+                except Exception as e:
+                    url = ""
+                    log("ricerca di Prometheus fallita:", type(e).__name__, e)
+                if url:
+                    self.a.prometheus_url = url
+                    break
+                log("nessun Prometheus con le metriche di Mentat: riprovo tra 60 s (intanto valori statici per zona)")
+                time.sleep(60)
+            last_bw = 0.0
+            while True:
+                t0 = time.time()
+                fields = ["rtt", "loss"]
+                if t0 - last_bw >= self.a.prom_bw_interval:
+                    fields.append("bw")
+                try:
+                    net = self.read_network(fields)
+                    with self.lock:
+                        self.net = net
+                    if "bw" in fields:
+                        last_bw = t0
+                    self.publish_network()
+                except Exception as e:
+                    self.count("prom_errors")
+                    log("Prometheus non letto:", type(e).__name__, e)
+                time.sleep(max(0.0, self.a.prom_interval - (time.time() - t0)))
+
+        def table(self, since=None):
+            with self.lock:
+                c = dict(self.counters)
+            c.update(self.mqtt.counters)
+            c["mqtt_connected"] = int(self.mqtt.connected)
+            k = getattr(self.disc, "k8s", None)
+            if k:
+                c["k8s_calls"], c["k8s_bytes"] = k.calls, k.bytes
+            return {"version": 0, "generated": time.time(), "models": self.endpoints, "network": self.net,
+                    "agent": {"mode": "global", "opt": True, "node": self.a.node, "zone": self.zones.get(self.a.node, ""),
+                              "counters": c, "cpu_s": round(time.process_time(), 3),
+                              "uptime_s": round(time.time() - self.started, 1)}}
+
+        def run(self):
+            try:
+                self.zones = self.disc.node_zones()
+            except Exception as e:
+                log("zone dei nodi non lette all'avvio:", e)
+            self.mqtt.start()
+            for f in (self.watch_loop, self.zones_loop, self.prom_loop) + ((self.load_loop,) if self.a.global_load else ()):
+                threading.Thread(target=f, daemon=True).start()
+            log(f"agente globale: broker {self.a.mqtt_host}:{self.a.mqtt_port}, Prometheus {self.a.prometheus_url or '-'} "
+                f"latenza/perdita ogni {self.a.prom_interval}s (finestra {self.a.prom_window}), banda ogni {self.a.prom_bw_interval}s")
+
+    def broker_node_start(state):
+        a = state.a
+
+        def on_connect(m):
+            m.subscribe([T_ENDPOINTS + "+", T_NETWORK + a.node, T_NODES]
+                        + ([T_LOAD + "+", T_STATUS + "+"] if (a.load or a.prom_load) else []))
+            state.load_sent_at = 0.0
+            m.publish(T_STATUS + a.node, {"online": True, "ts": time.time()})
+
+        def on_message(topic, payload):
+            d = json.loads(payload)
+            now = time.time()
+            with state.lock:
+                state.counters["recv_msgs"] += 1
+                state.counters["recv_bytes"] += len(payload)
+                if topic.startswith(T_ENDPOINTS):
+                    model = topic[len(T_ENDPOINTS):]
+                    pods = d.get("pods", [])
+                    if json.dumps(pods, sort_keys=True) != json.dumps(state.endpoints.get(model), sort_keys=True):
+                        state.endpoints[model] = pods
+                        state.counters["ep_msgs"] = state.counters.get("ep_msgs", 0) + 1
+                        state.counters["chg_delay_sum"] += max(0.0, now - d.get("ts", now))
+                        state.counters["chg_delay_n"] += 1
+                        mine = [dict(e, metrics=e.get("metrics") or metrics_url(e["addr"], a))
+                                for ps in state.endpoints.values() for e in ps if e["node"] == a.node]
+                        state.pod_list = mine
+                        names = {e["pod"] for e in mine}
+                        for g in [g for g in state.local if g not in names]:
+                            del state.local[g]
+                        state.bump({model})
+                elif topic.startswith(T_NETWORK):
+                    state.links = d.get("links", {})
+                    state.net_ts = d.get("ts", now)
+                    state.counters["net_msgs"] = state.counters.get("net_msgs", 0) + 1
+                elif topic == T_NODES:
+                    state.nodes = d.get("zones", {})
+                elif topic.startswith(T_STATUS):
+                    src = topic[len(T_STATUS):]
+                    alive = bool(d.get("online"))
+                    if src != a.node and state.status.get(src) != alive:
+                        state.status[src] = alive
+                        log(f"agente di {src}: {'online' if alive else 'offline (Last Will)'}")
+                        state.bump({e["model"] for ps in state.endpoints.values() for e in ps
+                                    if src == "global" or e["node"] == src})
+                elif topic.startswith(T_LOAD):
+                    src = topic[len(T_LOAD):]
+                    if src != a.node or a.prom_load:
+                        old = state.loads.get(src)
+                        state.loads[src] = d
+                        state.counters["load_msgs"] = state.counters.get("load_msgs", 0) + 1
+                        if not old or old.get("pods") != d.get("pods"):
+                            state.counters["chg_delay_sum"] += max(0.0, now - d.get("ts", now))
+                            state.counters["chg_delay_n"] += 1
+                            state.bump({e["model"] for ps in state.endpoints.values() for e in ps if e["node"] == src})
+
+        state.mqtt = Mqtt(a.mqtt_host, a.mqtt_port, f"routing-agent-{a.node}", a.mqtt_keepalive,
+                          will=(T_STATUS + a.node, json.dumps({"online": False}), True),
+                          on_connect=on_connect, on_message=on_message).start()
+
+        def policy_loop():
+            while True:
+                state.load_policy()
+                time.sleep(5)
+        threading.Thread(target=policy_loop, daemon=True).start()
+
+    def make_handler(state):
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj):
+                body = json.dumps(obj, separators=(",", ":")).encode()
+                if self.path.startswith("/table"):
+                    state.count("table_bytes", len(body))
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.startswith("/table"):
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    since = int(q["since"][0]) if q.get("since", [""])[0].isdigit() else None
+                    return self._send(200, state.table(since))
+                if self.path.startswith("/local"):
+                    with state.lock:
+                        entries = list(state.local.values())
+                    return self._send(200, {"from": state.a.node, "sent": time.time(), "full": True, "entries": entries})
+                if self.path.startswith("/healthz"):
+                    return self._send(200, {"ok": True})
+                self._send(404, {"error": "not found"})
+
+            def do_POST(self):
+                if not self.path.startswith("/update"):
+                    return self._send(404, {"error": "not found"})
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n)
+                try:
+                    apply_update(state, json.loads(raw), n)
+                except (ValueError, KeyError):
+                    return self._send(400, {"error": "json"})
+                self._send(200, {"ok": True})
+        return H
+
+    def parse_args():
+        env = os.environ.get
+        ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        ap.add_argument("--mode", default=env("ROUTING_MODE", "central"), choices=["central", "node", "broker", "global", "off"])
+        ap.add_argument("--opt", type=int, default=int(env("ROUTING_OPT", "0")),
+                        help="1 = versione ottimizzata (central: spinge ai router solo i cambiamenti; node: messaggi compatti, battito 3 s, niente ping)")
+        ap.add_argument("--node", default=env("NODE_NAME", ""))
+        ap.add_argument("--namespace", default=env("POD_NAMESPACE", "default"))
+        ap.add_argument("--port", type=int, default=int(env("AGENT_PORT", "9100")))
+        ap.add_argument("--interval", type=float, default=float(env("POLL_INTERVAL_S", "0.25")))
+        ap.add_argument("--heartbeat", type=float, default=float(env("HEARTBEAT_S", "0")) or None)
+        ap.add_argument("--router-port", type=int, default=int(env("ROUTER_CONTROL_PORT", "9180")),
+                        help="central-opt: porta di controllo di nginx su cui spingere la tabella")
+        ap.add_argument("--keepalive", type=float, default=float(env("KEEPALIVE_S", "1.5")),
+                        help="central-opt: conferma ai router se non cambia nulla (sotto staleS)")
+        ap.add_argument("--ping-interval", type=float, default=float(env("PING_INTERVAL_S", "1")))
+        ap.add_argument("--discovery-interval", type=float, default=float(env("DISCOVERY_INTERVAL_S", "5")))
+        ap.add_argument("--poll-timeout", type=float, default=float(env("POLL_TIMEOUT_S", "0.5")))
+        ap.add_argument("--policy-file", default=env("POLICY_FILE", "/etc/routing/policy.json"))
+        ap.add_argument("--model-selector", default=env("MODEL_SELECTOR", "app=localai-standalone,component=model"))
+        ap.add_argument("--peer-selector", default=env("PEER_SELECTOR", "app=localai-router"))
+        ap.add_argument("--zone-label", default=env("ZONE_LABEL", "topology.kubernetes.io/zone"))
+        ap.add_argument("--app-port", type=int, default=int(env("APP_PORT", "8080")))
+        ap.add_argument("--metrics-port", type=int, default=int(env("METRICS_PORT", "15090")))
+        ap.add_argument("--mqtt-host", default=env("MQTT_HOST", "localai-routing-broker"))
+        ap.add_argument("--mqtt-port", type=int, default=int(env("MQTT_PORT", "1883")))
+        ap.add_argument("--mqtt-keepalive", type=int, default=int(env("MQTT_KEEPALIVE_S", "30")))
+        ap.add_argument("--broker-grace", type=float, default=float(env("BROKER_GRACE_S", "30")),
+                        help="broker: per quanto i pod degli altri nodi restano validi dopo una disconnessione dal broker")
+        ap.add_argument("--net-stale", type=float, default=float(env("NET_STALE_S", "180")),
+                        help="broker: riga di rete più vecchia di così = ignorata (valori statici per zona)")
+        ap.add_argument("--prometheus-url", default=env("PROMETHEUS_URL", "auto"),
+                        help='"auto" (o vuota) = cerca nel cluster la Service di Prometheus con le metriche di Mentat')
+        ap.add_argument("--prom-interval", type=float, default=float(env("PROM_INTERVAL_S", "30")),
+                        help="global: lettura di latenza e perdita da Prometheus")
+        ap.add_argument("--prom-bw-interval", type=float, default=float(env("PROM_BW_INTERVAL_S", "120")),
+                        help="global: lettura della banda (Mentat la misura ogni 90-120 s)")
+        ap.add_argument("--prom-window", default=env("PROM_WINDOW", "1m"))
+        ap.add_argument("--prom-bw-window", default=env("PROM_BW_WINDOW", "5m"))
+        ap.add_argument("--net-refresh", type=float, default=float(env("NET_REFRESH_S", "60")),
+                        help="global: conferma della riga di rete anche se non cambia (deve restare sotto NET_STALE_S)")
+        ap.add_argument("--load", default=env("ROUTING_LOAD", "0"), choices=["0", "1", "prom"],
+                        help="broker: 1 = ogni agente legge e pubblica il carico dei suoi pod (broker-load); "
+                             "prom = il carico di tutti i pod lo pubblica l'agente globale da Prometheus (broker-prom)")
+        ap.add_argument("--global-load", type=int, default=int(env("GLOBAL_LOAD", "0")),
+                        help="global: 1 = pubblica anche il carico dei pod letto da Prometheus (broker-prom)")
+        ap.add_argument("--load-prom-interval", type=float, default=float(env("LOAD_PROM_INTERVAL_S", "5")))
+        ap.add_argument("--load-window-prom", default=env("LOAD_PROM_WINDOW", "30s"))
+        ap.add_argument("--load-workload-re", default=env("LOAD_WORKLOAD_RE", "local-ai-.*"))
+        ap.add_argument("--load-poll", type=float, default=float(env("LOAD_POLL_S", "2")),
+                        help="broker-load: lettura dei contatori di Envoy (sostituisce la lettura ogni 250 ms)")
+        ap.add_argument("--load-window", type=float, default=float(env("LOAD_WINDOW_S", "15")))
+        ap.add_argument("--load-th-r", type=float, default=float(env("LOAD_TH_R_S", "0.05")))
+        ap.add_argument("--load-th-l", type=float, default=float(env("LOAD_TH_L", "0.5")))
+        ap.add_argument("--load-th-rel", type=float, default=float(env("LOAD_TH_REL", "0.2")))
+        ap.add_argument("--load-confirm", type=float, default=float(env("LOAD_CONFIRM_S", "0")),
+                        help="broker-load: conferma periodica anche senza cambiamenti (0 = mai: vale il Last Will)")
+        ap.add_argument("--load-stale", type=float, default=float(env("LOAD_STALE_S", "0")),
+                        help="broker-load: età massima del carico di un altro nodo (0 = nessun limite, finché l'agente è online)")
+        ap.add_argument("--th-rtt-abs", type=float, default=float(env("TH_RTT_ABS_S", "0.002")))
+        ap.add_argument("--th-rtt-rel", type=float, default=float(env("TH_RTT_REL", "0.10")))
+        ap.add_argument("--th-loss", type=float, default=float(env("TH_LOSS", "0.02")))
+        ap.add_argument("--th-bw-rel", type=float, default=float(env("TH_BW_REL", "0.20")))
+        ap.add_argument("--static-file", default=env("STATIC_FILE", ""), help="prove locali: pod e peer da file")
+        a = ap.parse_args()
+        a.opt = bool(a.opt) or a.mode in ("broker", "global")
+        a.prom_load = a.load == "prom" and a.mode == "broker"
+        a.load = a.load == "1" and a.mode == "broker"
+        if a.load:
+            a.interval = a.load_poll
+        if not a.heartbeat:
+            a.heartbeat = 3.0 if a.opt else 1.0
+        return a
+
+    def main():
+        a = parse_args()
+        if a.mode == "off":
+            log("modalità off: nessuna raccolta")
+            while True:
+                time.sleep(3600)
+        if a.mode in ("node", "broker") and not a.node:
+            raise SystemExit(f"modalità {a.mode}: serve NODE_NAME")
+        disc = StaticDiscovery(a) if a.static_file else K8sDiscovery(a)
+        if a.mode == "global":
+            g = GlobalAgent(a, disc)
+            g.run()
+            ThreadingHTTPServer(("0.0.0.0", a.port), make_handler(g)).serve_forever()
+            return
+        state = State(a, disc)
+        state.load_policy()
+        if a.mode == "broker":
+            broker_node_start(state)
+        else:
+            threading.Thread(target=discovery_loop, args=(state,), daemon=True).start()
+        if not a.prom_load:
+            threading.Thread(target=poll_loop, args=(state,), daemon=True).start()
+        if a.mode == "central" and a.opt:
+            threading.Thread(target=router_push_loop, args=(state,), daemon=True).start()
+        if a.mode == "node":
+            threading.Thread(target=push_loop, args=(state,), daemon=True).start()
+            if not a.opt:
+                threading.Thread(target=ping_loop, args=(state,), daemon=True).start()
+        log(f"agente {a.mode}{' ottimizzato' if a.opt else ''} su :{a.port}, nodo={a.node or '-'}, "
+            f"lettura ogni {a.interval}s, battito {a.heartbeat}s")
+        ThreadingHTTPServer(("0.0.0.0", a.port), make_handler(state)).serve_forever()
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            import traceback
+            traceback.print_exc()
+            log("AGENTE FERMO per errore:", type(e).__name__, e, "- il router continua con la Service")
+            while True:
+                time.sleep(3600)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localai-routing-policy
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-router
+data:
+  policy.json: |
+    {
+      "weights": {"queue": 1, "network": 1, "loss": 1, "bandwidth": 1},
+      "serviceTimeS": {"default": 1.0, "qwen2-5-0-5b-instruct": 0.9, "llama-3-2-1b-instruct": 2.0},
+      "networkRttS": {"sameNode": 0, "sameZone": 0.001, "crossZone": 0.07},
+      "networkSource": "measured",
+      "networkRttMultiplier": 2,
+      "staleS": 3,
+      "hysteresisS": 0.2,
+      "remoteWindowFactor": 1,
+      "lossPenaltyS": 2,
+      "transferBytes": 16384
+    }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: localai-router
+  namespace: {{ .namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: localai-routing-{{ .namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: localai-routing-{{ .namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: localai-routing-{{ .namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: localai-router
+    namespace: {{ .namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localai-routing-broker
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-routing-broker
+data:
+  mosquitto.conf: |
+    listener 1883
+    allow_anonymous true
+    persistence false
+    max_keepalive 120
+    log_type error
+    log_type warning
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localai-routing-broker
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-routing-broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: localai-routing-broker
+  template:
+    metadata:
+      labels:
+        app: localai-routing-broker
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      schedulerName: {{ .schedulerName }}
+      {{- if $brokerNode }}
+      nodeSelector:
+        kubernetes.io/hostname: {{ $brokerNode }}
+      {{- end }}
+      containers:
+        - name: mosquitto
+          image: {{ $brokerImage }}
+          ports:
+            - { name: mqtt, containerPort: 1883 }
+          readinessProbe:
+            tcpSocket: { port: mqtt }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 10m, memory: 8Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+          volumeMounts:
+            - { name: conf, mountPath: /mosquitto/config/mosquitto.conf, subPath: mosquitto.conf }
+      volumes:
+        - { name: conf, configMap: { name: localai-routing-broker } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: localai-routing-broker
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-routing-broker
+spec:
+  selector:
+    app: localai-routing-broker
+  ports:
+    - { name: tcp-mqtt, port: 1883, targetPort: mqtt }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localai-routing-global
+  namespace: {{ .namespace }}
+  labels:
+    app: localai-routing-global
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: localai-routing-global
+  template:
+    metadata:
+      labels:
+        app: localai-routing-global
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      schedulerName: {{ .schedulerName }}
+      serviceAccountName: localai-router
+      {{- if $brokerNode }}
+      nodeSelector:
+        kubernetes.io/hostname: {{ $brokerNode }}
+      {{- end }}
+      containers:
+        - name: routing-agent
+          image: {{ $agentImage }}
+          command: ["python3", "-u", "/etc/routing/routing-agent.py"]
+          env:
+            - { name: ROUTING_MODE, value: global }
+            - { name: NODE_NAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: MQTT_HOST, value: "localai-routing-broker.{{ .namespace }}.svc.cluster.local" }
+            - { name: PROMETHEUS_URL, value: "{{ $prometheusUrl }}" }
+            - { name: PROM_INTERVAL_S, value: "30" }
+            - { name: PROM_BW_INTERVAL_S, value: "120" }
+            - { name: PROM_WINDOW, value: "1m" }
+            - { name: GLOBAL_LOAD, value: "1" }
+            - { name: LOAD_PROM_INTERVAL_S, value: "5" }
+            - { name: LOAD_PROM_WINDOW, value: "30s" }
+            - { name: LOAD_TH_REL, value: "0.3" }
+            - { name: LOAD_TH_R_S, value: "0.1" }
+          ports:
+            - { name: table, containerPort: 9100 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: table }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 300m, memory: 128Mi }
+          volumeMounts:
+            - { name: conf, mountPath: /etc/routing/routing-agent.py, subPath: routing-agent.py }
+      volumes:
+        - { name: conf, configMap: { name: localai-router-conf } }
+{{- range $node := .proxyNodes }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localai-router-{{ $node }}
+  namespace: {{ $.namespace }}
+  labels:
+    app: localai-router
+    component: node-proxy
+    router-node: "{{ $node }}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: localai-router
+      router-node: "{{ $node }}"
+  template:
+    metadata:
+      labels:
+        app: localai-router
+        component: node-proxy
+        router-node: "{{ $node }}"
+        version: "{{ $node }}"
+      annotations:
+        traffic.sidecar.istio.io/excludeOutboundPorts: "8080,1883"
+        traffic.sidecar.istio.io/excludeInboundPorts: "9100"
+    spec:
+      schedulerName: {{ $.schedulerName }}
+      serviceAccountName: localai-router
+      nodeSelector:
+        kubernetes.io/hostname: {{ $node }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          env:
+            - { name: ROUTING_TABLE_URL, value: "http://127.0.0.1:9100/table" }
+            - { name: NODE_NAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /nginx-healthz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+          volumeMounts:
+            - { name: conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf }
+            - { name: conf, mountPath: /etc/nginx/njs/router.js, subPath: router.js }
+        - name: routing-agent
+          image: {{ $agentImage }}
+          command: ["python3", "-u", "/etc/routing/routing-agent.py"]
+          env:
+            - { name: ROUTING_MODE, value: broker }
+            - { name: ROUTING_LOAD, value: prom }
+            - { name: NODE_NAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: POLICY_FILE, value: /etc/routing-policy/policy.json }
+            - { name: MQTT_HOST, value: "localai-routing-broker.{{ $.namespace }}.svc.cluster.local" }
+          ports:
+            - { name: table, containerPort: 9100 }
+          resources:
+            requests: { cpu: 20m, memory: 24Mi }
+            limits: { cpu: 300m, memory: 96Mi }
+          volumeMounts:
+            - { name: conf, mountPath: /etc/routing/routing-agent.py, subPath: routing-agent.py }
+            - { name: policy, mountPath: /etc/routing-policy }
+      volumes:
+        - { name: conf, configMap: { name: localai-router-conf } }
+        - { name: policy, configMap: { name: localai-routing-policy } }
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-proxy-{{ .group }}
+  namespace: {{ .namespace }}
+  labels:
+    group: "{{ .group }}"
+    component: node-proxy
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app: localai-router
+    component: node-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      {{- if .proxyNodePort }}
+      nodePort: {{ .proxyNodePort }}
+      {{- end }}
+{{- end }}
