@@ -1923,7 +1923,7 @@ data:
         ap.add_argument("--poll-timeout", type=float, default=float(env("POLL_TIMEOUT_S", "0.5")))
         ap.add_argument("--policy-file", default=env("POLICY_FILE", "/etc/routing/policy.json"))
         ap.add_argument("--model-selector", default=env("MODEL_SELECTOR", "app=localai-standalone,component=model"))
-        ap.add_argument("--peer-selector", default=env("PEER_SELECTOR", "app=localai-router"))
+        ap.add_argument("--peer-selector", default=env("PEER_SELECTOR", "component=node-proxy"))
         ap.add_argument("--zone-label", default=env("ZONE_LABEL", "topology.kubernetes.io/zone"))
         ap.add_argument("--app-port", type=int, default=int(env("APP_PORT", "8080")))
         ap.add_argument("--metrics-port", type=int, default=int(env("METRICS_PORT", "15090")))
@@ -2200,19 +2200,19 @@ metadata:
   name: localai-router-{{ $node }}
   namespace: {{ $.namespace }}
   labels:
-    app: localai-router
+    app: localai-router-{{ $node }}
     component: node-proxy
     router-node: "{{ $node }}"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: localai-router
+      app: localai-router-{{ $node }}
       router-node: "{{ $node }}"
   template:
     metadata:
       labels:
-        app: localai-router
+        app: localai-router-{{ $node }}
         component: node-proxy
         router-node: "{{ $node }}"
       annotations:
@@ -2278,7 +2278,6 @@ spec:
   type: NodePort
   externalTrafficPolicy: Local
   selector:
-    app: localai-router
     component: node-proxy
   ports:
     - name: http
